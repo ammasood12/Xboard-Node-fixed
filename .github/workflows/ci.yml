@@ -69,6 +69,7 @@ jobs:
           path: xbctl-${{ matrix.goos }}-${{ matrix.goarch }}
 
   build-docker:
+    if: false
     name: Build & Push Docker Image
     runs-on: ubuntu-latest
     needs: test
