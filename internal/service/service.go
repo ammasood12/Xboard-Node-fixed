@@ -226,10 +226,12 @@ func (s *Service) Run(ctx context.Context) error {
 		case <-pullTicker.C:
 			// When WebSocket is connected, skip REST polling entirely.
 			// Config/user updates arrive via WS push.
-			if s.wsClient != nil && s.wsClient.IsConnected() {
-				continue
-			}
-			nlog.Core().Debug("polling from API (ws not connected)")
+			// if s.wsClient != nil && s.wsClient.IsConnected() {
+			//	continue
+			//}
+			//nlog.Core().Debug("polling from API (ws not connected)")
+			// When WebSocket is connected, don't skip REST polling entirely.
+			nlog.Core().Debug("polling from API")
 			s.pullViaAPIAsync(ctx)
 
 		case result := <-s.pullResults:
