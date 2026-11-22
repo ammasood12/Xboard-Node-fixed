@@ -1,0 +1,648 @@
+diff --git a/internal/kernel/singbox/conntracker.go b/internal/kernel/singbox/conntracker.go
+index bcd8ada..c6d5aa1 100644
+--- a/internal/kernel/singbox/conntracker.go
++++ b/internal/kernel/singbox/conntracker.go
+@@ -34,35 +34,76 @@ type userStats struct {
+ 	upload   atomic.Int64
+ 	download atomic.Int64
+ 
+-	mu        sync.RWMutex             // RWMutex for concurrent reads
+-	ips       map[string]int           // sourceIP → refcount (number of active conns from that IP)
+-	act       map[string]*atomic.Int64 // sourceIP → unix nanos of its last connect or client data
+-	connCount int                      // total active connections
+-	departed  map[string]time.Time     // sourceIP → when it last went offline here
++	mu        sync.RWMutex           // RWMutex for concurrent reads
++	ips       map[string]int         // sourceIP → refcount (number of active conns from that IP)
++	act       map[string]*ipActivity // sourceIP → bytes it moved in the recent past
++	connCount int                    // total active connections
++	departed  map[string]time.Time   // sourceIP → when it last went offline here
++}
++
++// An IP counts as a device only while it moves real traffic: at least
++// deviceMinBytes in the last ~deviceBucketN*deviceBucketDur (60 s). Open but
++// quiet sockets (dead paths after a network switch, idle keepalives, the
++// trickle of a carrier-NAT pool IP) move far less and so do not count, and a
++// bare new connection is not activity either. This mirrors V2bX's
++// DeviceOnlineMinTraffic (100 KB). It only decides which IPs are devices;
++// traffic accounting is unchanged.
++const (
++	deviceBucketDur = 10 * time.Second
++	deviceBucketN   = 6
++	deviceMinBytes  = 100 * 1024
++)
++
++// ipActivity is a sliding byte window for one source IP: deviceBucketN buckets
++// of deviceBucketDur each (the current partial bucket plus the previous
++// deviceBucketN-1, so 50-60 s). Lock-free: it is updated on every read and
++// write of every connection from the IP.
++type ipActivity struct {
++	stamp [deviceBucketN]atomic.Int64 // bucket index each slot currently holds
++	bytes [deviceBucketN]atomic.Int64 // bytes moved in that bucket
+ }
+ 
+-// deviceActiveWindow is how long an IP keeps counting as a device after it
+-// last connected or sent data. A connection that goes silent without closing
+-// (a client that changed network, a dead path) would otherwise count until
+-// TCP keepalive gives up on it, many minutes later.
+-const deviceActiveWindow = 180 * time.Second
++// add records n bytes moved now. Safe on a nil receiver.
++func (a *ipActivity) add(n int64) { a.addAt(n, time.Now()) }
++
++func (a *ipActivity) addAt(n int64, now time.Time) {
++	if a == nil || n <= 0 {
++		return
++	}
++	idx := now.UnixNano() / int64(deviceBucketDur)
++	i := int(idx % deviceBucketN)
++	if old := a.stamp[i].Load(); old != idx && a.stamp[i].CompareAndSwap(old, idx) {
++		a.bytes[i].Store(0) // slot held an expired bucket
++	}
++	a.bytes[i].Add(n)
++}
++
++// sumAt returns the bytes moved within the window ending at now.
++func (a *ipActivity) sumAt(now time.Time) int64 {
++	idx := now.UnixNano() / int64(deviceBucketDur)
++	var sum int64
++	for i := range a.stamp {
++		if s := a.stamp[i].Load(); s > idx-deviceBucketN && s <= idx {
++			sum += a.bytes[i].Load()
++		}
++	}
++	return sum
++}
+ 
+ // addConn registers a new connection from sourceIP and returns the IP's
+-// activity stamp; a new connection counts as activity.
+-func (u *userStats) addConn(sourceIP string) *atomic.Int64 {
+-	now := time.Now().UnixNano()
++// activity window. A new connection is not activity by itself.
++func (u *userStats) addConn(sourceIP string) *ipActivity {
+ 	u.mu.Lock()
+ 	u.connCount++
+ 	u.ips[sourceIP]++
+ 	if u.act == nil {
+-		u.act = make(map[string]*atomic.Int64)
++		u.act = make(map[string]*ipActivity)
+ 	}
+ 	cell := u.act[sourceIP]
+ 	if cell == nil {
+-		cell = new(atomic.Int64)
++		cell = new(ipActivity)
+ 		u.act[sourceIP] = cell
+ 	}
+-	cell.Store(now)
+ 	u.mu.Unlock()
+ 	return cell
+ }
+@@ -80,31 +121,19 @@ func (u *userStats) removeConn(sourceIP string) {
+ 	u.mu.Unlock()
+ }
+ 
+-// activeIPs returns the IPs, with their connection counts, that connected or
+-// sent data within window of now. An IP with connections but no activity
+-// stamp counts as active. The caller holds u.mu.
+-func (u *userStats) activeIPs(now time.Time, window time.Duration) map[string]int {
+-	cutoff := now.Add(-window).UnixNano()
++// activeIPs returns the IPs, with their connection counts, that moved at least
++// deviceMinBytes in the current window. An IP with connections but no activity
++// window counts as active. The caller holds u.mu.
++func (u *userStats) activeIPs(now time.Time) map[string]int {
+ 	active := make(map[string]int, len(u.ips))
+ 	for ip, n := range u.ips {
+-		if cell := u.act[ip]; cell == nil || cell.Load() >= cutoff {
++		if cell := u.act[ip]; cell == nil || cell.sumAt(now) >= deviceMinBytes {
+ 			active[ip] = n
+ 		}
+ 	}
+ 	return active
+ }
+ 
+-// touchActivity marks the IP behind cell as active now. Stamps newer than a
+-// second are left alone, so busy connections do not hammer one cache line.
+-func touchActivity(cell *atomic.Int64) {
+-	if cell == nil {
+-		return
+-	}
+-	if now := time.Now().UnixNano(); now-cell.Load() > int64(time.Second) {
+-		cell.Store(now)
+-	}
+-}
+-
+ // markDeparted records that sourceIP just went offline here and forgets
+ // departures too old to match any global state that is still fresh. The
+ // caller holds u.mu.
+@@ -164,7 +193,7 @@ func (u *userStats) aliveIPList() map[string]bool {
+ 	if len(u.ips) == 0 {
+ 		return nil
+ 	}
+-	active := u.activeIPs(time.Now(), deviceActiveWindow)
++	active := u.activeIPs(time.Now())
+ 	result := make(map[string]bool, len(active))
+ 	for ip := range active {
+ 		result[ip] = true
+@@ -353,7 +382,7 @@ func (t *ConnTracker) RoutedConnection(
+ 	}
+ 
+ 	// Register connection
+-	var act *atomic.Int64
++	var act *ipActivity
+ 	if us != nil {
+ 		act = us.addConn(sourceIP)
+ 	}
+@@ -408,7 +437,7 @@ func (t *ConnTracker) RoutedPacketConnection(
+ 		}
+ 	}
+ 
+-	var act *atomic.Int64
++	var act *ipActivity
+ 	if us != nil {
+ 		act = us.addConn(sourceIP)
+ 	}
+@@ -465,8 +494,8 @@ func (t *ConnTracker) checkDeviceGate(us *userStats, userID int, sourceIP string
+ 
+ 	us.mu.RLock()
+ 	defer us.mu.RUnlock()
+-	// Only IPs active within deviceActiveWindow count against the limit.
+-	local := us.activeIPs(time.Now(), deviceActiveWindow)
++	// Only IPs that moved at least deviceMinBytes recently count against the limit.
++	local := us.activeIPs(time.Now())
+ 	if kernel.AdmitDevice(local, t.devicesElsewhere(us, userID), sourceIP, limit) {
+ 		return false
+ 	}
+@@ -518,7 +547,7 @@ func (t *ConnTracker) disconnectOverLimit() {
+ 			continue
+ 		}
+ 		us.mu.RLock()
+-		ips := kernel.OverLimitDevices(us.activeIPs(time.Now(), deviceActiveWindow), t.devicesElsewhere(us, uid), limit)
++		ips := kernel.OverLimitDevices(us.activeIPs(time.Now()), t.devicesElsewhere(us, uid), limit)
+ 		us.mu.RUnlock()
+ 		for _, ip := range ips {
+ 			if over[uid] == nil {
+@@ -709,9 +738,9 @@ func (r *RateLimitedReadCloser) Read(b []byte) (int, error) {
+ type trackedConn struct {
+ 	net.Conn
+ 	tracker  *ConnTracker
+-	us       *userStats    // per-user stats (upload/download atomics + IP tracking)
+-	act      *atomic.Int64 // activity stamp of sourceIP (nil without us)
+-	userID   int           // user ID for device tracking
++	us       *userStats  // per-user stats (upload/download atomics + IP tracking)
++	act      *ipActivity // byte window of sourceIP (nil without us)
++	userID   int         // user ID for device tracking
+ 	connID   string
+ 	sourceIP string
+ 	// upLimiter throttles reads (user upload), downLimiter writes (download).
+@@ -729,7 +758,7 @@ func (c *trackedConn) Read(b []byte) (int, error) {
+ 	}
+ 	n, err := c.Conn.Read(b)
+ 	if n > 0 {
+-		touchActivity(c.act)
++		c.act.add(int64(n))
+ 		if c.us != nil {
+ 			c.us.upload.Add(int64(n)) // 从入站读取 = 用户上传
+ 		}
+@@ -778,8 +807,11 @@ func (c *trackedConn) Write(b []byte) (int, error) {
+ 	}
+ 
+ 	n, err := c.Conn.Write(b)
+-	if n > 0 && c.us != nil {
+-		c.us.download.Add(int64(n)) // 向入站写入 = 用户下载
++	if n > 0 {
++		c.act.add(int64(n))
++		if c.us != nil {
++			c.us.download.Add(int64(n)) // 向入站写入 = 用户下载
++		}
+ 	}
+ 	return n, err
+ }
+@@ -823,10 +855,10 @@ func (c *trackedConn) UnwrapReader() (io.Reader, []N.CountFunc) {
+ 	if c.us == nil {
+ 		return c.Conn, nil
+ 	}
+-	// Zero-copy relaying bypasses Read, so client data is also stamped here.
++	// Zero-copy relaying bypasses Read, so the bytes are also counted here.
+ 	count := c.makeCountFunc(&c.us.upload, c.upLimiter) // 从入站读取 = 用户上传
+ 	return c.Conn, []N.CountFunc{func(n int64) {
+-		touchActivity(c.act)
++		c.act.add(n)
+ 		count(n)
+ 	}}
+ }
+@@ -835,7 +867,12 @@ func (c *trackedConn) UnwrapWriter() (io.Writer, []N.CountFunc) {
+ 	if c.us == nil {
+ 		return c.Conn, nil
+ 	}
+-	return c.Conn, []N.CountFunc{c.makeCountFunc(&c.us.download, c.downLimiter)} // 向入站写入 = 用户下载
++	// Zero-copy relaying bypasses Write, so the bytes are also counted here.
++	count := c.makeCountFunc(&c.us.download, c.downLimiter) // 向入站写入 = 用户下载
++	return c.Conn, []N.CountFunc{func(n int64) {
++		c.act.add(n)
++		count(n)
++	}}
+ }
+ 
+ func (c *trackedConn) Upstream() any           { return c.Conn }
+@@ -848,7 +885,7 @@ type trackedPacketConn struct {
+ 	N.PacketConn
+ 	tracker  *ConnTracker
+ 	us       *userStats
+-	act      *atomic.Int64 // activity stamp of sourceIP (nil without us)
++	act      *ipActivity // byte window of sourceIP (nil without us)
+ 	userID   int
+ 	connID   string
+ 	sourceIP string
+@@ -862,8 +899,8 @@ type trackedPacketConn struct {
+ func (c *trackedPacketConn) ReadPacket(buffer *buf.Buffer) (singM.Socksaddr, error) {
+ 	dest, err := c.PacketConn.ReadPacket(buffer)
+ 	if err == nil {
+-		touchActivity(c.act)
+ 		n := int64(buffer.Len())
++		c.act.add(n)
+ 		if c.us != nil {
+ 			c.us.upload.Add(n) // 从入站读取 = 用户上传
+ 		}
+@@ -910,8 +947,11 @@ func (c *trackedPacketConn) WritePacket(buffer *buf.Buffer, dest singM.Socksaddr
+ 	}
+ 
+ 	err := c.PacketConn.WritePacket(buffer, dest)
+-	if err == nil && c.us != nil {
+-		c.us.download.Add(n) // 向入站写入 = 用户下载
++	if err == nil {
++		c.act.add(n)
++		if c.us != nil {
++			c.us.download.Add(n) // 向入站写入 = 用户下载
++		}
+ 	}
+ 	return err
+ }
+@@ -953,11 +993,11 @@ func (c *trackedPacketConn) UnwrapPacketReader() (N.PacketReader, []N.CountFunc)
+ 	if c.us == nil {
+ 		return c.PacketConn, nil
+ 	}
+-	// Zero-copy relaying bypasses ReadPacket, so client packets are also
+-	// stamped here.
++	// Zero-copy relaying bypasses ReadPacket, so the bytes are also counted
++	// here.
+ 	count := c.makeCountFunc(&c.us.download, c.upLimiter)
+ 	return c.PacketConn, []N.CountFunc{func(n int64) {
+-		touchActivity(c.act)
++		c.act.add(n)
+ 		count(n)
+ 	}}
+ }
+@@ -966,7 +1006,11 @@ func (c *trackedPacketConn) UnwrapPacketWriter() (N.PacketWriter, []N.CountFunc)
+ 	if c.us == nil {
+ 		return c.PacketConn, nil
+ 	}
+-	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.upload, c.downLimiter)}
++	count := c.makeCountFunc(&c.us.upload, c.downLimiter)
++	return c.PacketConn, []N.CountFunc{func(n int64) {
++		c.act.add(n)
++		count(n)
++	}}
+ }
+ 
+ func (c *trackedPacketConn) Upstream() any           { return c.PacketConn }
+diff --git a/internal/kernel/singbox/conntracker_activity_test.go b/internal/kernel/singbox/conntracker_activity_test.go
+index 5e834d0..60f805f 100644
+--- a/internal/kernel/singbox/conntracker_activity_test.go
++++ b/internal/kernel/singbox/conntracker_activity_test.go
+@@ -6,147 +6,190 @@ import (
+ 	"time"
+ )
+ 
+-// backdate sets ip's activity stamp to d ago.
+-func backdate(us *userStats, ip string, d time.Duration) {
+-	us.mu.Lock()
+-	us.act[ip].Store(time.Now().Add(-d).UnixNano())
+-	us.mu.Unlock()
++const kb = 1024
++
++// bucketStart returns a time aligned to the start of a bucket, so window edges
++// in the tests are exact.
++func bucketStart() time.Time {
++	const dur = int64(deviceBucketDur)
++	return time.Unix(0, (time.Now().UnixNano()/dur)*dur)
+ }
+ 
+-func TestAliveIPListDropsIdleIPs(t *testing.T) {
++func TestAliveIPListCountsOnlyIPsOverThreshold(t *testing.T) {
+ 	us := &userStats{ips: make(map[string]int)}
+ 	if got := us.aliveIPList(); got != nil {
+ 		t.Fatalf("no connections: got %v, want nil", got)
+ 	}
+ 
+-	us.addConn("1.1.1.1")
+-	us.addConn("2.2.2.2")
+-	backdate(us, "2.2.2.2", deviceActiveWindow+time.Second)
++	busy := us.addConn("1.1.1.1")
++	us.addConn("2.2.2.2") // connected, moved nothing
++	busy.add(deviceMinBytes)
+ 
+ 	got := us.aliveIPList()
+ 	if len(got) != 1 || !got["1.1.1.1"] {
+-		t.Fatalf("one idle IP: got %v, want only 1.1.1.1", got)
++		t.Fatalf("got %v, want only 1.1.1.1", got)
+ 	}
++}
+ 
+-	backdate(us, "1.1.1.1", deviceActiveWindow+time.Second)
+-	got = us.aliveIPList()
++func TestAliveIPListEmptySetWhenNobodyIsActive(t *testing.T) {
++	us := &userStats{ips: make(map[string]int)}
++	us.addConn("1.1.1.1")
++	got := us.aliveIPList()
+ 	if got == nil || len(got) != 0 {
+-		t.Fatalf("all IPs idle: got %v, want an empty non-nil set", got)
++		t.Fatalf("connections but no traffic: got %v, want an empty non-nil set", got)
+ 	}
+ }
+ 
+-func TestIPInsideWindowStaysActive(t *testing.T) {
++func TestNewConnectionAloneIsNotActivity(t *testing.T) {
+ 	us := &userStats{ips: make(map[string]int)}
+ 	us.addConn("1.1.1.1")
+-	backdate(us, "1.1.1.1", deviceActiveWindow-10*time.Second)
+-	if got := us.aliveIPList(); !got["1.1.1.1"] {
+-		t.Fatalf("IP idle for less than the window dropped: %v", got)
++	us.addConn("1.1.1.1")
++	if got := us.aliveIPList(); got["1.1.1.1"] {
++		t.Fatalf("bare connections counted as a device: %v", got)
++	}
++	if us.ips["1.1.1.1"] != 2 {
++		t.Fatalf("refcount = %d, want 2", us.ips["1.1.1.1"])
+ 	}
+ }
+ 
+-func TestTouchActivityRefreshesIdleIP(t *testing.T) {
++func TestThresholdBoundary(t *testing.T) {
++	now := bucketStart()
+ 	us := &userStats{ips: make(map[string]int)}
+-	cell := us.addConn("1.1.1.1")
+-	backdate(us, "1.1.1.1", deviceActiveWindow+time.Second)
+-	if got := us.aliveIPList(); got["1.1.1.1"] {
+-		t.Fatalf("IP should be idle, got %v", got)
++	below := us.addConn("1.1.1.1")
++	exact := us.addConn("2.2.2.2")
++	below.addAt(deviceMinBytes-1, now)
++	exact.addAt(deviceMinBytes, now)
++
++	got := us.activeIPs(now)
++	if _, ok := got["1.1.1.1"]; ok {
++		t.Fatal("IP just under the threshold counted")
++	}
++	if _, ok := got["2.2.2.2"]; !ok {
++		t.Fatal("IP at the threshold not counted")
+ 	}
++}
+ 
+-	touchActivity(cell)
+-	if got := us.aliveIPList(); !got["1.1.1.1"] {
+-		t.Fatalf("client data did not revive the IP: %v", got)
++func TestBytesSpreadAcrossBucketsAdd(t *testing.T) {
++	t0 := bucketStart()
++	a := new(ipActivity)
++	a.addAt(60*kb, t0)
++	a.addAt(60*kb, t0.Add(30*time.Second))
++	if got := a.sumAt(t0.Add(30 * time.Second)); got != 120*kb {
++		t.Fatalf("sum = %d, want %d", got, 120*kb)
+ 	}
+ }
+ 
+-func TestTouchActivityLeavesFreshStampAlone(t *testing.T) {
+-	us := &userStats{ips: make(map[string]int)}
+-	cell := us.addConn("1.1.1.1")
+-	fresh := time.Now().Add(-500 * time.Millisecond).UnixNano()
+-	cell.Store(fresh)
+-	touchActivity(cell)
+-	if cell.Load() != fresh {
+-		t.Fatal("stamp younger than a second was rewritten")
+-	}
+-	touchActivity(nil) // must not panic
++func TestWindowExpiresAfterSixtySeconds(t *testing.T) {
++	t0 := bucketStart()
++	a := new(ipActivity)
++	a.addAt(deviceMinBytes, t0)
++
++	if got := a.sumAt(t0.Add(59 * time.Second)); got != deviceMinBytes {
++		t.Fatalf("at 59s: sum = %d, want %d", got, deviceMinBytes)
++	}
++	if got := a.sumAt(t0.Add(60 * time.Second)); got != 0 {
++		t.Fatalf("at 60s: sum = %d, want 0", got)
++	}
+ }
+ 
+-func TestNewConnectionRevivesIdleIP(t *testing.T) {
+-	us := &userStats{ips: make(map[string]int)}
+-	us.addConn("1.1.1.1")
+-	backdate(us, "1.1.1.1", deviceActiveWindow+time.Second)
++func TestOldBytesDoNotAddToNewOnes(t *testing.T) {
++	t0 := bucketStart()
++	a := new(ipActivity)
++	a.addAt(60*kb, t0)
++	a.addAt(60*kb, t0.Add(70*time.Second)) // first bucket expired
++	if got := a.sumAt(t0.Add(70 * time.Second)); got != 60*kb {
++		t.Fatalf("sum = %d, want %d: expired bucket leaked into the window", got, 60*kb)
++	}
++}
+ 
+-	us.addConn("1.1.1.1")
+-	if got := us.aliveIPList(); !got["1.1.1.1"] {
+-		t.Fatalf("new connection did not revive the IP: %v", got)
++func TestReusedBucketSlotIsReset(t *testing.T) {
++	t0 := bucketStart()
++	a := new(ipActivity)
++	a.addAt(90*kb, t0)
++	// Six buckets later the same slot is reused and must start from zero.
++	a.addAt(20*kb, t0.Add(deviceBucketN*deviceBucketDur))
++	if got := a.sumAt(t0.Add(deviceBucketN * deviceBucketDur)); got != 20*kb {
++		t.Fatalf("sum = %d, want %d", got, 20*kb)
+ 	}
+-	if us.ips["1.1.1.1"] != 2 {
+-		t.Fatalf("refcount = %d, want 2", us.ips["1.1.1.1"])
++}
++
++func TestIPActivityNilAndEmptyAreSafe(t *testing.T) {
++	var a *ipActivity
++	a.add(1) // must not panic
++	b := new(ipActivity)
++	b.add(0)
++	b.add(-5)
++	if got := b.sumAt(time.Now()); got != 0 {
++		t.Fatalf("sum = %d, want 0", got)
+ 	}
+ }
+ 
+-func TestRemoveConnDropsActivityStamp(t *testing.T) {
++func TestRemoveConnDropsActivity(t *testing.T) {
+ 	us := &userStats{ips: make(map[string]int)}
+ 	us.addConn("1.1.1.1")
+ 	us.addConn("1.1.1.1")
+ 	us.removeConn("1.1.1.1")
+ 	if _, ok := us.act["1.1.1.1"]; !ok {
+-		t.Fatal("stamp dropped while a connection from the IP remains")
++		t.Fatal("activity dropped while a connection from the IP remains")
+ 	}
+ 	us.removeConn("1.1.1.1")
+ 	if _, ok := us.act["1.1.1.1"]; ok {
+-		t.Fatal("stamp kept after the last connection closed")
++		t.Fatal("activity kept after the last connection closed")
+ 	}
+ }
+ 
+-func TestCheckDeviceGateIgnoresIdleIPs(t *testing.T) {
++func TestCheckDeviceGateIgnoresQuietIPs(t *testing.T) {
+ 	tracker := NewConnTracker(0)
+ 	tracker.SetUserMap(map[string]int{"uuid-1": 1})
+ 	us := tracker.users[1]
+ 
+-	// 1.1.1.1 holds a connection but has been silent past the window, so it
+-	// does not use up the single slot.
++	// 1.1.1.1 holds a connection but moves nothing, so it does not use up
++	// the single slot.
+ 	us.addConn("1.1.1.1")
+-	backdate(us, "1.1.1.1", deviceActiveWindow+time.Second)
+ 	if tracker.checkDeviceGate(us, 1, "2.2.2.2", 1) {
+-		t.Fatal("new device rejected although the only other IP is idle")
++		t.Fatal("new device rejected although the only other IP is quiet")
+ 	}
+ 
+-	// Once 2.2.2.2 is active, the idle device coming back is the extra one.
+-	us.addConn("2.2.2.2")
++	// Once 2.2.2.2 moves real traffic, the quiet device coming back is the
++	// extra one.
++	us.addConn("2.2.2.2").add(deviceMinBytes)
+ 	if !tracker.checkDeviceGate(us, 1, "1.1.1.1", 1) {
+-		t.Fatal("idle device returning at the limit should be rejected")
++		t.Fatal("quiet device returning at the limit should be rejected")
+ 	}
+ 	if tracker.checkDeviceGate(us, 1, "2.2.2.2", 1) {
+ 		t.Fatal("active device must stay admitted")
+ 	}
+ }
+ 
+-func TestRoutedConnectionClientDataRefreshesActivity(t *testing.T) {
++func TestRoutedConnectionCountsReadsAndWrites(t *testing.T) {
+ 	tracker := NewConnTracker(0)
+ 	tracker.SetUserMap(map[string]int{"uuid-1": 1})
+-	base := &testConn{reads: [][]byte{[]byte("hello")}}
++	base := &testConn{reads: [][]byte{make([]byte, 60*kb)}}
+ 	wrapped := tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", "1.1.1.1"), nil, nil)
+-
+ 	us := tracker.users[1]
+-	backdate(us, "1.1.1.1", deviceActiveWindow+time.Second)
++
+ 	if got := us.aliveIPList(); got["1.1.1.1"] {
+-		t.Fatalf("IP should be idle, got %v", got)
++		t.Fatalf("no traffic yet but IP counted: %v", got)
+ 	}
+-
+-	if _, err := wrapped.Read(make([]byte, 16)); err != nil {
++	if _, err := wrapped.Read(make([]byte, 64*kb)); err != nil {
+ 		t.Fatalf("Read() error = %v", err)
+ 	}
++	if got := us.aliveIPList(); got["1.1.1.1"] {
++		t.Fatalf("60 KB is under the threshold: %v", got)
++	}
++	if _, err := wrapped.Write(make([]byte, 50*kb)); err != nil {
++		t.Fatalf("Write() error = %v", err)
++	}
+ 	if got := us.aliveIPList(); !got["1.1.1.1"] {
+-		t.Fatalf("client data did not revive the IP: %v", got)
++		t.Fatalf("60 KB read + 50 KB written should pass 100 KB: %v", got)
+ 	}
+ }
+ 
+-func TestGetUserTrafficReportsEmptySetForIdleUser(t *testing.T) {
++func TestGetUserTrafficReportsEmptySetForQuietUser(t *testing.T) {
+ 	tracker := NewConnTracker(0)
+ 	tracker.SetUserMap(map[string]int{"uuid-1": 1, "uuid-2": 2})
+ 	base := &testConn{}
+ 	tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", "1.1.1.1"), nil, nil)
+-	backdate(tracker.users[1], "1.1.1.1", deviceActiveWindow+time.Second)
+ 
+ 	_, aliveIPs, connCount := tracker.GetUserTraffic()
+ 	if connCount != 1 {
+@@ -154,7 +197,7 @@ func TestGetUserTrafficReportsEmptySetForIdleUser(t *testing.T) {
+ 	}
+ 	set, ok := aliveIPs[1]
+ 	if !ok || set == nil || len(set) != 0 {
+-		t.Fatalf("idle user: aliveIPs[1] = %v (present %v), want an empty set", set, ok)
++		t.Fatalf("quiet user: aliveIPs[1] = %v (present %v), want an empty set", set, ok)
+ 	}
+ 	if _, ok := aliveIPs[2]; ok {
+ 		t.Fatal("user without connections must stay out of the report")
+diff --git a/internal/kernel/singbox/singbox_test.go b/internal/kernel/singbox/singbox_test.go
+index e9be919..9b76ae8 100644
+--- a/internal/kernel/singbox/singbox_test.go
++++ b/internal/kernel/singbox/singbox_test.go
+@@ -96,8 +96,13 @@ func TestConnTrackerRoutedConnectionTracksTrafficAndAliveIPs(t *testing.T) {
+ 	if got := traffic[1]; got != [2]int64{5, 3} {
+ 		t.Fatalf("traffic[1] = %v, want [5 3]", got)
+ 	}
+-	if !aliveIPs[1]["1.1.1.1"] {
+-		t.Fatal("expected alive IP to include source address")
++	// 8 bytes is below the device threshold: connected, but not a device yet.
++	if set, ok := aliveIPs[1]; !ok || len(set) != 0 {
++		t.Fatalf("quiet connection: aliveIPs[1] = %v, want an empty set", set)
++	}
++	wrapped.(*trackedConn).act.add(deviceMinBytes)
++	if _, aliveIPs, _ = tracker.GetUserTraffic(); !aliveIPs[1]["1.1.1.1"] {
++		t.Fatal("expected alive IP to include source address once it moved enough data")
+ 	}
+ 	if connCount != 1 {
+ 		t.Fatalf("connCount = %d, want 1", connCount)
+@@ -130,6 +135,7 @@ func TestConnTrackerRoutedConnectionRejectsWhenDeviceLimitExceeded(t *testing.T)
+ 	if wrapped1 == first {
+ 		t.Fatal("expected first connection to be wrapped")
+ 	}
++	wrapped1.(*trackedConn).act.add(deviceMinBytes) // the first device is really in use
+ 
+ 	second := &testConn{}
+ 	wrapped2 := tracker.RoutedConnection(context.Background(), second, testInboundContext("uuid-1", "2.2.2.2"), nil, nil)
+@@ -145,7 +151,7 @@ func TestConnTrackerCheckDeviceGateMergesFreshGlobalDevices(t *testing.T) {
+ 	tracker := NewConnTracker(0)
+ 	tracker.SetUserMap(map[string]int{"uuid-1": 1})
+ 	us := tracker.users[1]
+-	us.addConn("1.1.1.1")
++	us.addConn("1.1.1.1").add(deviceMinBytes)
+ 	tracker.UpdateGlobalDevices(map[int][]string{1: {"9.9.9.9"}})
+ 
+ 	for _, ip := range []string{"2.2.2.2", "99.99.99.99"} {
+@@ -224,6 +230,9 @@ func limitedTracker(limit int) *ConnTracker {
+ func admitted(tracker *ConnTracker, ip string) (net.Conn, bool) {
+ 	base := &testConn{}
+ 	wrapped := tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", ip), nil, nil)
++	if tc, ok := wrapped.(*trackedConn); ok {
++		tc.act.add(deviceMinBytes) // an admitted device that is really in use
++	}
+ 	return wrapped, wrapped != net.Conn(base)
+ }
+ 
+@@ -273,7 +282,7 @@ func TestConnTrackerCountsDepartedDeviceStillOnlineElsewhere(t *testing.T) {
+ func TestConnTrackerGlobalStateDisconnectsDeviceOverLimit(t *testing.T) {
+ 	tracker := limitedTracker(1)
+ 	base := &testConn{}
+-	tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", "9.9.9.9"), nil, nil)
++	tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", "9.9.9.9"), nil, nil).(*trackedConn).act.add(deviceMinBytes)
+ 	tracker.UpdateGlobalDevices(map[int][]string{1: {"1.1.1.1", "9.9.9.9"}})
+ 
+ 	if !base.closed {
+@@ -300,7 +309,7 @@ func TestConnTrackerGlobalStateKeepsDevicesWithinLimit(t *testing.T) {
+ 		t.Run(name, func(t *testing.T) {
+ 			tracker := limitedTracker(tc.limit)
+ 			base := &testConn{}
+-			tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", tc.local), nil, nil)
++			tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", tc.local), nil, nil).(*trackedConn).act.add(deviceMinBytes)
+ 			tracker.UpdateGlobalDevices(map[int][]string{1: tc.global})
+ 			if base.closed {
+ 				t.Error("device within the limit was disconnected")
+@@ -315,7 +324,7 @@ func TestConnTrackerGlobalEchoDoesNotDisconnectNextDevice(t *testing.T) {
+ 	old, _ := admitted(tracker, "1.1.1.1")
+ 	old.Close()
+ 	base := &testConn{}
+-	tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", "9.9.9.9"), nil, nil)
++	tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", "9.9.9.9"), nil, nil).(*trackedConn).act.add(deviceMinBytes)
+ 	tracker.UpdateGlobalDevices(map[int][]string{1: {"1.1.1.1", "9.9.9.9"}})
+ 
+ 	if base.closed {

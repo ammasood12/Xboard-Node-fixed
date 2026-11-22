@@ -34,35 +34,76 @@ type userStats struct {
 	upload   atomic.Int64
 	download atomic.Int64
 
-	mu        sync.RWMutex             // RWMutex for concurrent reads
-	ips       map[string]int           // sourceIP → refcount (number of active conns from that IP)
-	act       map[string]*atomic.Int64 // sourceIP → unix nanos of its last connect or client data
-	connCount int                      // total active connections
-	departed  map[string]time.Time     // sourceIP → when it last went offline here
+	mu        sync.RWMutex           // RWMutex for concurrent reads
+	ips       map[string]int         // sourceIP → refcount (number of active conns from that IP)
+	act       map[string]*ipActivity // sourceIP → bytes it moved in the recent past
+	connCount int                    // total active connections
+	departed  map[string]time.Time   // sourceIP → when it last went offline here
 }
 
-// deviceActiveWindow is how long an IP keeps counting as a device after it
-// last connected or sent data. A connection that goes silent without closing
-// (a client that changed network, a dead path) would otherwise count until
-// TCP keepalive gives up on it, many minutes later.
-const deviceActiveWindow = 180 * time.Second
+// An IP counts as a device only while it moves real traffic: at least
+// deviceMinBytes in the last ~deviceBucketN*deviceBucketDur (60 s). Open but
+// quiet sockets (dead paths after a network switch, idle keepalives, the
+// trickle of a carrier-NAT pool IP) move far less and so do not count, and a
+// bare new connection is not activity either. This mirrors V2bX's
+// DeviceOnlineMinTraffic (100 KB). It only decides which IPs are devices;
+// traffic accounting is unchanged.
+const (
+	deviceBucketDur = 10 * time.Second
+	deviceBucketN   = 6
+	deviceMinBytes  = 100 * 1024
+)
+
+// ipActivity is a sliding byte window for one source IP: deviceBucketN buckets
+// of deviceBucketDur each (the current partial bucket plus the previous
+// deviceBucketN-1, so 50-60 s). Lock-free: it is updated on every read and
+// write of every connection from the IP.
+type ipActivity struct {
+	stamp [deviceBucketN]atomic.Int64 // bucket index each slot currently holds
+	bytes [deviceBucketN]atomic.Int64 // bytes moved in that bucket
+}
+
+// add records n bytes moved now. Safe on a nil receiver.
+func (a *ipActivity) add(n int64) { a.addAt(n, time.Now()) }
+
+func (a *ipActivity) addAt(n int64, now time.Time) {
+	if a == nil || n <= 0 {
+		return
+	}
+	idx := now.UnixNano() / int64(deviceBucketDur)
+	i := int(idx % deviceBucketN)
+	if old := a.stamp[i].Load(); old != idx && a.stamp[i].CompareAndSwap(old, idx) {
+		a.bytes[i].Store(0) // slot held an expired bucket
+	}
+	a.bytes[i].Add(n)
+}
+
+// sumAt returns the bytes moved within the window ending at now.
+func (a *ipActivity) sumAt(now time.Time) int64 {
+	idx := now.UnixNano() / int64(deviceBucketDur)
+	var sum int64
+	for i := range a.stamp {
+		if s := a.stamp[i].Load(); s > idx-deviceBucketN && s <= idx {
+			sum += a.bytes[i].Load()
+		}
+	}
+	return sum
+}
 
 // addConn registers a new connection from sourceIP and returns the IP's
-// activity stamp; a new connection counts as activity.
-func (u *userStats) addConn(sourceIP string) *atomic.Int64 {
-	now := time.Now().UnixNano()
+// activity window. A new connection is not activity by itself.
+func (u *userStats) addConn(sourceIP string) *ipActivity {
 	u.mu.Lock()
 	u.connCount++
 	u.ips[sourceIP]++
 	if u.act == nil {
-		u.act = make(map[string]*atomic.Int64)
+		u.act = make(map[string]*ipActivity)
 	}
 	cell := u.act[sourceIP]
 	if cell == nil {
-		cell = new(atomic.Int64)
+		cell = new(ipActivity)
 		u.act[sourceIP] = cell
 	}
-	cell.Store(now)
 	u.mu.Unlock()
 	return cell
 }
@@ -80,29 +121,17 @@ func (u *userStats) removeConn(sourceIP string) {
 	u.mu.Unlock()
 }
 
-// activeIPs returns the IPs, with their connection counts, that connected or
-// sent data within window of now. An IP with connections but no activity
-// stamp counts as active. The caller holds u.mu.
-func (u *userStats) activeIPs(now time.Time, window time.Duration) map[string]int {
-	cutoff := now.Add(-window).UnixNano()
+// activeIPs returns the IPs, with their connection counts, that moved at least
+// deviceMinBytes in the current window. An IP with connections but no activity
+// window counts as active. The caller holds u.mu.
+func (u *userStats) activeIPs(now time.Time) map[string]int {
 	active := make(map[string]int, len(u.ips))
 	for ip, n := range u.ips {
-		if cell := u.act[ip]; cell == nil || cell.Load() >= cutoff {
+		if cell := u.act[ip]; cell == nil || cell.sumAt(now) >= deviceMinBytes {
 			active[ip] = n
 		}
 	}
 	return active
-}
-
-// touchActivity marks the IP behind cell as active now. Stamps newer than a
-// second are left alone, so busy connections do not hammer one cache line.
-func touchActivity(cell *atomic.Int64) {
-	if cell == nil {
-		return
-	}
-	if now := time.Now().UnixNano(); now-cell.Load() > int64(time.Second) {
-		cell.Store(now)
-	}
 }
 
 // markDeparted records that sourceIP just went offline here and forgets
@@ -164,7 +193,7 @@ func (u *userStats) aliveIPList() map[string]bool {
 	if len(u.ips) == 0 {
 		return nil
 	}
-	active := u.activeIPs(time.Now(), deviceActiveWindow)
+	active := u.activeIPs(time.Now())
 	result := make(map[string]bool, len(active))
 	for ip := range active {
 		result[ip] = true
@@ -353,7 +382,7 @@ func (t *ConnTracker) RoutedConnection(
 	}
 
 	// Register connection
-	var act *atomic.Int64
+	var act *ipActivity
 	if us != nil {
 		act = us.addConn(sourceIP)
 	}
@@ -408,7 +437,7 @@ func (t *ConnTracker) RoutedPacketConnection(
 		}
 	}
 
-	var act *atomic.Int64
+	var act *ipActivity
 	if us != nil {
 		act = us.addConn(sourceIP)
 	}
@@ -465,8 +494,8 @@ func (t *ConnTracker) checkDeviceGate(us *userStats, userID int, sourceIP string
 
 	us.mu.RLock()
 	defer us.mu.RUnlock()
-	// Only IPs active within deviceActiveWindow count against the limit.
-	local := us.activeIPs(time.Now(), deviceActiveWindow)
+	// Only IPs that moved at least deviceMinBytes recently count against the limit.
+	local := us.activeIPs(time.Now())
 	if kernel.AdmitDevice(local, t.devicesElsewhere(us, userID), sourceIP, limit) {
 		return false
 	}
@@ -518,7 +547,7 @@ func (t *ConnTracker) disconnectOverLimit() {
 			continue
 		}
 		us.mu.RLock()
-		ips := kernel.OverLimitDevices(us.activeIPs(time.Now(), deviceActiveWindow), t.devicesElsewhere(us, uid), limit)
+		ips := kernel.OverLimitDevices(us.activeIPs(time.Now()), t.devicesElsewhere(us, uid), limit)
 		us.mu.RUnlock()
 		for _, ip := range ips {
 			if over[uid] == nil {
@@ -709,9 +738,9 @@ func (r *RateLimitedReadCloser) Read(b []byte) (int, error) {
 type trackedConn struct {
 	net.Conn
 	tracker  *ConnTracker
-	us       *userStats    // per-user stats (upload/download atomics + IP tracking)
-	act      *atomic.Int64 // activity stamp of sourceIP (nil without us)
-	userID   int           // user ID for device tracking
+	us       *userStats  // per-user stats (upload/download atomics + IP tracking)
+	act      *ipActivity // byte window of sourceIP (nil without us)
+	userID   int         // user ID for device tracking
 	connID   string
 	sourceIP string
 	// upLimiter throttles reads (user upload), downLimiter writes (download).
@@ -729,7 +758,7 @@ func (c *trackedConn) Read(b []byte) (int, error) {
 	}
 	n, err := c.Conn.Read(b)
 	if n > 0 {
-		touchActivity(c.act)
+		c.act.add(int64(n))
 		if c.us != nil {
 			c.us.upload.Add(int64(n)) // 从入站读取 = 用户上传
 		}
@@ -778,8 +807,11 @@ func (c *trackedConn) Write(b []byte) (int, error) {
 	}
 
 	n, err := c.Conn.Write(b)
-	if n > 0 && c.us != nil {
-		c.us.download.Add(int64(n)) // 向入站写入 = 用户下载
+	if n > 0 {
+		c.act.add(int64(n))
+		if c.us != nil {
+			c.us.download.Add(int64(n)) // 向入站写入 = 用户下载
+		}
 	}
 	return n, err
 }
@@ -823,10 +855,10 @@ func (c *trackedConn) UnwrapReader() (io.Reader, []N.CountFunc) {
 	if c.us == nil {
 		return c.Conn, nil
 	}
-	// Zero-copy relaying bypasses Read, so client data is also stamped here.
+	// Zero-copy relaying bypasses Read, so the bytes are also counted here.
 	count := c.makeCountFunc(&c.us.upload, c.upLimiter) // 从入站读取 = 用户上传
 	return c.Conn, []N.CountFunc{func(n int64) {
-		touchActivity(c.act)
+		c.act.add(n)
 		count(n)
 	}}
 }
@@ -835,7 +867,12 @@ func (c *trackedConn) UnwrapWriter() (io.Writer, []N.CountFunc) {
 	if c.us == nil {
 		return c.Conn, nil
 	}
-	return c.Conn, []N.CountFunc{c.makeCountFunc(&c.us.download, c.downLimiter)} // 向入站写入 = 用户下载
+	// Zero-copy relaying bypasses Write, so the bytes are also counted here.
+	count := c.makeCountFunc(&c.us.download, c.downLimiter) // 向入站写入 = 用户下载
+	return c.Conn, []N.CountFunc{func(n int64) {
+		c.act.add(n)
+		count(n)
+	}}
 }
 
 func (c *trackedConn) Upstream() any           { return c.Conn }
@@ -848,7 +885,7 @@ type trackedPacketConn struct {
 	N.PacketConn
 	tracker  *ConnTracker
 	us       *userStats
-	act      *atomic.Int64 // activity stamp of sourceIP (nil without us)
+	act      *ipActivity // byte window of sourceIP (nil without us)
 	userID   int
 	connID   string
 	sourceIP string
@@ -862,8 +899,8 @@ type trackedPacketConn struct {
 func (c *trackedPacketConn) ReadPacket(buffer *buf.Buffer) (singM.Socksaddr, error) {
 	dest, err := c.PacketConn.ReadPacket(buffer)
 	if err == nil {
-		touchActivity(c.act)
 		n := int64(buffer.Len())
+		c.act.add(n)
 		if c.us != nil {
 			c.us.upload.Add(n) // 从入站读取 = 用户上传
 		}
@@ -910,8 +947,11 @@ func (c *trackedPacketConn) WritePacket(buffer *buf.Buffer, dest singM.Socksaddr
 	}
 
 	err := c.PacketConn.WritePacket(buffer, dest)
-	if err == nil && c.us != nil {
-		c.us.download.Add(n) // 向入站写入 = 用户下载
+	if err == nil {
+		c.act.add(n)
+		if c.us != nil {
+			c.us.download.Add(n) // 向入站写入 = 用户下载
+		}
 	}
 	return err
 }
@@ -953,11 +993,11 @@ func (c *trackedPacketConn) UnwrapPacketReader() (N.PacketReader, []N.CountFunc)
 	if c.us == nil {
 		return c.PacketConn, nil
 	}
-	// Zero-copy relaying bypasses ReadPacket, so client packets are also
-	// stamped here.
+	// Zero-copy relaying bypasses ReadPacket, so the bytes are also counted
+	// here.
 	count := c.makeCountFunc(&c.us.download, c.upLimiter)
 	return c.PacketConn, []N.CountFunc{func(n int64) {
-		touchActivity(c.act)
+		c.act.add(n)
 		count(n)
 	}}
 }
@@ -966,7 +1006,11 @@ func (c *trackedPacketConn) UnwrapPacketWriter() (N.PacketWriter, []N.CountFunc)
 	if c.us == nil {
 		return c.PacketConn, nil
 	}
-	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.upload, c.downLimiter)}
+	count := c.makeCountFunc(&c.us.upload, c.downLimiter)
+	return c.PacketConn, []N.CountFunc{func(n int64) {
+		c.act.add(n)
+		count(n)
+	}}
 }
 
 func (c *trackedPacketConn) Upstream() any           { return c.PacketConn }

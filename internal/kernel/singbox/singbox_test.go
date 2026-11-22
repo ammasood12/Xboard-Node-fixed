@@ -96,8 +96,13 @@ func TestConnTrackerRoutedConnectionTracksTrafficAndAliveIPs(t *testing.T) {
 	if got := traffic[1]; got != [2]int64{5, 3} {
 		t.Fatalf("traffic[1] = %v, want [5 3]", got)
 	}
-	if !aliveIPs[1]["1.1.1.1"] {
-		t.Fatal("expected alive IP to include source address")
+	// 8 bytes is below the device threshold: connected, but not a device yet.
+	if set, ok := aliveIPs[1]; !ok || len(set) != 0 {
+		t.Fatalf("quiet connection: aliveIPs[1] = %v, want an empty set", set)
+	}
+	wrapped.(*trackedConn).act.add(deviceMinBytes)
+	if _, aliveIPs, _ = tracker.GetUserTraffic(); !aliveIPs[1]["1.1.1.1"] {
+		t.Fatal("expected alive IP to include source address once it moved enough data")
 	}
 	if connCount != 1 {
 		t.Fatalf("connCount = %d, want 1", connCount)
@@ -130,6 +135,7 @@ func TestConnTrackerRoutedConnectionRejectsWhenDeviceLimitExceeded(t *testing.T)
 	if wrapped1 == first {
 		t.Fatal("expected first connection to be wrapped")
 	}
+	wrapped1.(*trackedConn).act.add(deviceMinBytes) // the first device is really in use
 
 	second := &testConn{}
 	wrapped2 := tracker.RoutedConnection(context.Background(), second, testInboundContext("uuid-1", "2.2.2.2"), nil, nil)
@@ -145,7 +151,7 @@ func TestConnTrackerCheckDeviceGateMergesFreshGlobalDevices(t *testing.T) {
 	tracker := NewConnTracker(0)
 	tracker.SetUserMap(map[string]int{"uuid-1": 1})
 	us := tracker.users[1]
-	us.addConn("1.1.1.1")
+	us.addConn("1.1.1.1").add(deviceMinBytes)
 	tracker.UpdateGlobalDevices(map[int][]string{1: {"9.9.9.9"}})
 
 	for _, ip := range []string{"2.2.2.2", "99.99.99.99"} {
@@ -224,6 +230,9 @@ func limitedTracker(limit int) *ConnTracker {
 func admitted(tracker *ConnTracker, ip string) (net.Conn, bool) {
 	base := &testConn{}
 	wrapped := tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", ip), nil, nil)
+	if tc, ok := wrapped.(*trackedConn); ok {
+		tc.act.add(deviceMinBytes) // an admitted device that is really in use
+	}
 	return wrapped, wrapped != net.Conn(base)
 }
 
@@ -273,7 +282,7 @@ func TestConnTrackerCountsDepartedDeviceStillOnlineElsewhere(t *testing.T) {
 func TestConnTrackerGlobalStateDisconnectsDeviceOverLimit(t *testing.T) {
 	tracker := limitedTracker(1)
 	base := &testConn{}
-	tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", "9.9.9.9"), nil, nil)
+	tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", "9.9.9.9"), nil, nil).(*trackedConn).act.add(deviceMinBytes)
 	tracker.UpdateGlobalDevices(map[int][]string{1: {"1.1.1.1", "9.9.9.9"}})
 
 	if !base.closed {
@@ -300,7 +309,7 @@ func TestConnTrackerGlobalStateKeepsDevicesWithinLimit(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			tracker := limitedTracker(tc.limit)
 			base := &testConn{}
-			tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", tc.local), nil, nil)
+			tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", tc.local), nil, nil).(*trackedConn).act.add(deviceMinBytes)
 			tracker.UpdateGlobalDevices(map[int][]string{1: tc.global})
 			if base.closed {
 				t.Error("device within the limit was disconnected")
@@ -315,7 +324,7 @@ func TestConnTrackerGlobalEchoDoesNotDisconnectNextDevice(t *testing.T) {
 	old, _ := admitted(tracker, "1.1.1.1")
 	old.Close()
 	base := &testConn{}
-	tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", "9.9.9.9"), nil, nil)
+	tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", "9.9.9.9"), nil, nil).(*trackedConn).act.add(deviceMinBytes)
 	tracker.UpdateGlobalDevices(map[int][]string{1: {"1.1.1.1", "9.9.9.9"}})
 
 	if base.closed {

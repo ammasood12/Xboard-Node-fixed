@@ -6,147 +6,190 @@ import (
 	"time"
 )
 
-// backdate sets ip's activity stamp to d ago.
-func backdate(us *userStats, ip string, d time.Duration) {
-	us.mu.Lock()
-	us.act[ip].Store(time.Now().Add(-d).UnixNano())
-	us.mu.Unlock()
+const kb = 1024
+
+// bucketStart returns a time aligned to the start of a bucket, so window edges
+// in the tests are exact.
+func bucketStart() time.Time {
+	const dur = int64(deviceBucketDur)
+	return time.Unix(0, (time.Now().UnixNano()/dur)*dur)
 }
 
-func TestAliveIPListDropsIdleIPs(t *testing.T) {
+func TestAliveIPListCountsOnlyIPsOverThreshold(t *testing.T) {
 	us := &userStats{ips: make(map[string]int)}
 	if got := us.aliveIPList(); got != nil {
 		t.Fatalf("no connections: got %v, want nil", got)
 	}
 
-	us.addConn("1.1.1.1")
-	us.addConn("2.2.2.2")
-	backdate(us, "2.2.2.2", deviceActiveWindow+time.Second)
+	busy := us.addConn("1.1.1.1")
+	us.addConn("2.2.2.2") // connected, moved nothing
+	busy.add(deviceMinBytes)
 
 	got := us.aliveIPList()
 	if len(got) != 1 || !got["1.1.1.1"] {
-		t.Fatalf("one idle IP: got %v, want only 1.1.1.1", got)
+		t.Fatalf("got %v, want only 1.1.1.1", got)
 	}
+}
 
-	backdate(us, "1.1.1.1", deviceActiveWindow+time.Second)
-	got = us.aliveIPList()
+func TestAliveIPListEmptySetWhenNobodyIsActive(t *testing.T) {
+	us := &userStats{ips: make(map[string]int)}
+	us.addConn("1.1.1.1")
+	got := us.aliveIPList()
 	if got == nil || len(got) != 0 {
-		t.Fatalf("all IPs idle: got %v, want an empty non-nil set", got)
+		t.Fatalf("connections but no traffic: got %v, want an empty non-nil set", got)
 	}
 }
 
-func TestIPInsideWindowStaysActive(t *testing.T) {
+func TestNewConnectionAloneIsNotActivity(t *testing.T) {
 	us := &userStats{ips: make(map[string]int)}
 	us.addConn("1.1.1.1")
-	backdate(us, "1.1.1.1", deviceActiveWindow-10*time.Second)
-	if got := us.aliveIPList(); !got["1.1.1.1"] {
-		t.Fatalf("IP idle for less than the window dropped: %v", got)
-	}
-}
-
-func TestTouchActivityRefreshesIdleIP(t *testing.T) {
-	us := &userStats{ips: make(map[string]int)}
-	cell := us.addConn("1.1.1.1")
-	backdate(us, "1.1.1.1", deviceActiveWindow+time.Second)
+	us.addConn("1.1.1.1")
 	if got := us.aliveIPList(); got["1.1.1.1"] {
-		t.Fatalf("IP should be idle, got %v", got)
-	}
-
-	touchActivity(cell)
-	if got := us.aliveIPList(); !got["1.1.1.1"] {
-		t.Fatalf("client data did not revive the IP: %v", got)
-	}
-}
-
-func TestTouchActivityLeavesFreshStampAlone(t *testing.T) {
-	us := &userStats{ips: make(map[string]int)}
-	cell := us.addConn("1.1.1.1")
-	fresh := time.Now().Add(-500 * time.Millisecond).UnixNano()
-	cell.Store(fresh)
-	touchActivity(cell)
-	if cell.Load() != fresh {
-		t.Fatal("stamp younger than a second was rewritten")
-	}
-	touchActivity(nil) // must not panic
-}
-
-func TestNewConnectionRevivesIdleIP(t *testing.T) {
-	us := &userStats{ips: make(map[string]int)}
-	us.addConn("1.1.1.1")
-	backdate(us, "1.1.1.1", deviceActiveWindow+time.Second)
-
-	us.addConn("1.1.1.1")
-	if got := us.aliveIPList(); !got["1.1.1.1"] {
-		t.Fatalf("new connection did not revive the IP: %v", got)
+		t.Fatalf("bare connections counted as a device: %v", got)
 	}
 	if us.ips["1.1.1.1"] != 2 {
 		t.Fatalf("refcount = %d, want 2", us.ips["1.1.1.1"])
 	}
 }
 
-func TestRemoveConnDropsActivityStamp(t *testing.T) {
+func TestThresholdBoundary(t *testing.T) {
+	now := bucketStart()
+	us := &userStats{ips: make(map[string]int)}
+	below := us.addConn("1.1.1.1")
+	exact := us.addConn("2.2.2.2")
+	below.addAt(deviceMinBytes-1, now)
+	exact.addAt(deviceMinBytes, now)
+
+	got := us.activeIPs(now)
+	if _, ok := got["1.1.1.1"]; ok {
+		t.Fatal("IP just under the threshold counted")
+	}
+	if _, ok := got["2.2.2.2"]; !ok {
+		t.Fatal("IP at the threshold not counted")
+	}
+}
+
+func TestBytesSpreadAcrossBucketsAdd(t *testing.T) {
+	t0 := bucketStart()
+	a := new(ipActivity)
+	a.addAt(60*kb, t0)
+	a.addAt(60*kb, t0.Add(30*time.Second))
+	if got := a.sumAt(t0.Add(30 * time.Second)); got != 120*kb {
+		t.Fatalf("sum = %d, want %d", got, 120*kb)
+	}
+}
+
+func TestWindowExpiresAfterSixtySeconds(t *testing.T) {
+	t0 := bucketStart()
+	a := new(ipActivity)
+	a.addAt(deviceMinBytes, t0)
+
+	if got := a.sumAt(t0.Add(59 * time.Second)); got != deviceMinBytes {
+		t.Fatalf("at 59s: sum = %d, want %d", got, deviceMinBytes)
+	}
+	if got := a.sumAt(t0.Add(60 * time.Second)); got != 0 {
+		t.Fatalf("at 60s: sum = %d, want 0", got)
+	}
+}
+
+func TestOldBytesDoNotAddToNewOnes(t *testing.T) {
+	t0 := bucketStart()
+	a := new(ipActivity)
+	a.addAt(60*kb, t0)
+	a.addAt(60*kb, t0.Add(70*time.Second)) // first bucket expired
+	if got := a.sumAt(t0.Add(70 * time.Second)); got != 60*kb {
+		t.Fatalf("sum = %d, want %d: expired bucket leaked into the window", got, 60*kb)
+	}
+}
+
+func TestReusedBucketSlotIsReset(t *testing.T) {
+	t0 := bucketStart()
+	a := new(ipActivity)
+	a.addAt(90*kb, t0)
+	// Six buckets later the same slot is reused and must start from zero.
+	a.addAt(20*kb, t0.Add(deviceBucketN*deviceBucketDur))
+	if got := a.sumAt(t0.Add(deviceBucketN * deviceBucketDur)); got != 20*kb {
+		t.Fatalf("sum = %d, want %d", got, 20*kb)
+	}
+}
+
+func TestIPActivityNilAndEmptyAreSafe(t *testing.T) {
+	var a *ipActivity
+	a.add(1) // must not panic
+	b := new(ipActivity)
+	b.add(0)
+	b.add(-5)
+	if got := b.sumAt(time.Now()); got != 0 {
+		t.Fatalf("sum = %d, want 0", got)
+	}
+}
+
+func TestRemoveConnDropsActivity(t *testing.T) {
 	us := &userStats{ips: make(map[string]int)}
 	us.addConn("1.1.1.1")
 	us.addConn("1.1.1.1")
 	us.removeConn("1.1.1.1")
 	if _, ok := us.act["1.1.1.1"]; !ok {
-		t.Fatal("stamp dropped while a connection from the IP remains")
+		t.Fatal("activity dropped while a connection from the IP remains")
 	}
 	us.removeConn("1.1.1.1")
 	if _, ok := us.act["1.1.1.1"]; ok {
-		t.Fatal("stamp kept after the last connection closed")
+		t.Fatal("activity kept after the last connection closed")
 	}
 }
 
-func TestCheckDeviceGateIgnoresIdleIPs(t *testing.T) {
+func TestCheckDeviceGateIgnoresQuietIPs(t *testing.T) {
 	tracker := NewConnTracker(0)
 	tracker.SetUserMap(map[string]int{"uuid-1": 1})
 	us := tracker.users[1]
 
-	// 1.1.1.1 holds a connection but has been silent past the window, so it
-	// does not use up the single slot.
+	// 1.1.1.1 holds a connection but moves nothing, so it does not use up
+	// the single slot.
 	us.addConn("1.1.1.1")
-	backdate(us, "1.1.1.1", deviceActiveWindow+time.Second)
 	if tracker.checkDeviceGate(us, 1, "2.2.2.2", 1) {
-		t.Fatal("new device rejected although the only other IP is idle")
+		t.Fatal("new device rejected although the only other IP is quiet")
 	}
 
-	// Once 2.2.2.2 is active, the idle device coming back is the extra one.
-	us.addConn("2.2.2.2")
+	// Once 2.2.2.2 moves real traffic, the quiet device coming back is the
+	// extra one.
+	us.addConn("2.2.2.2").add(deviceMinBytes)
 	if !tracker.checkDeviceGate(us, 1, "1.1.1.1", 1) {
-		t.Fatal("idle device returning at the limit should be rejected")
+		t.Fatal("quiet device returning at the limit should be rejected")
 	}
 	if tracker.checkDeviceGate(us, 1, "2.2.2.2", 1) {
 		t.Fatal("active device must stay admitted")
 	}
 }
 
-func TestRoutedConnectionClientDataRefreshesActivity(t *testing.T) {
+func TestRoutedConnectionCountsReadsAndWrites(t *testing.T) {
 	tracker := NewConnTracker(0)
 	tracker.SetUserMap(map[string]int{"uuid-1": 1})
-	base := &testConn{reads: [][]byte{[]byte("hello")}}
+	base := &testConn{reads: [][]byte{make([]byte, 60*kb)}}
 	wrapped := tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", "1.1.1.1"), nil, nil)
-
 	us := tracker.users[1]
-	backdate(us, "1.1.1.1", deviceActiveWindow+time.Second)
-	if got := us.aliveIPList(); got["1.1.1.1"] {
-		t.Fatalf("IP should be idle, got %v", got)
-	}
 
-	if _, err := wrapped.Read(make([]byte, 16)); err != nil {
+	if got := us.aliveIPList(); got["1.1.1.1"] {
+		t.Fatalf("no traffic yet but IP counted: %v", got)
+	}
+	if _, err := wrapped.Read(make([]byte, 64*kb)); err != nil {
 		t.Fatalf("Read() error = %v", err)
 	}
+	if got := us.aliveIPList(); got["1.1.1.1"] {
+		t.Fatalf("60 KB is under the threshold: %v", got)
+	}
+	if _, err := wrapped.Write(make([]byte, 50*kb)); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
 	if got := us.aliveIPList(); !got["1.1.1.1"] {
-		t.Fatalf("client data did not revive the IP: %v", got)
+		t.Fatalf("60 KB read + 50 KB written should pass 100 KB: %v", got)
 	}
 }
 
-func TestGetUserTrafficReportsEmptySetForIdleUser(t *testing.T) {
+func TestGetUserTrafficReportsEmptySetForQuietUser(t *testing.T) {
 	tracker := NewConnTracker(0)
 	tracker.SetUserMap(map[string]int{"uuid-1": 1, "uuid-2": 2})
 	base := &testConn{}
 	tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", "1.1.1.1"), nil, nil)
-	backdate(tracker.users[1], "1.1.1.1", deviceActiveWindow+time.Second)
 
 	_, aliveIPs, connCount := tracker.GetUserTraffic()
 	if connCount != 1 {
@@ -154,7 +197,7 @@ func TestGetUserTrafficReportsEmptySetForIdleUser(t *testing.T) {
 	}
 	set, ok := aliveIPs[1]
 	if !ok || set == nil || len(set) != 0 {
-		t.Fatalf("idle user: aliveIPs[1] = %v (present %v), want an empty set", set, ok)
+		t.Fatalf("quiet user: aliveIPs[1] = %v (present %v), want an empty set", set, ok)
 	}
 	if _, ok := aliveIPs[2]; ok {
 		t.Fatal("user without connections must stay out of the report")
