@@ -34,18 +34,37 @@ type userStats struct {
 	upload   atomic.Int64
 	download atomic.Int64
 
-	mu        sync.RWMutex         // RWMutex for concurrent reads
-	ips       map[string]int       // sourceIP → refcount (number of active conns from that IP)
-	connCount int                  // total active connections
-	departed  map[string]time.Time // sourceIP → when it last went offline here
+	mu        sync.RWMutex             // RWMutex for concurrent reads
+	ips       map[string]int           // sourceIP → refcount (number of active conns from that IP)
+	act       map[string]*atomic.Int64 // sourceIP → unix nanos of its last connect or client data
+	connCount int                      // total active connections
+	departed  map[string]time.Time     // sourceIP → when it last went offline here
 }
 
-// addConn registers a new connection from sourceIP.
-func (u *userStats) addConn(sourceIP string) {
+// deviceActiveWindow is how long an IP keeps counting as a device after it
+// last connected or sent data. A connection that goes silent without closing
+// (a client that changed network, a dead path) would otherwise count until
+// TCP keepalive gives up on it, many minutes later.
+const deviceActiveWindow = 180 * time.Second
+
+// addConn registers a new connection from sourceIP and returns the IP's
+// activity stamp; a new connection counts as activity.
+func (u *userStats) addConn(sourceIP string) *atomic.Int64 {
+	now := time.Now().UnixNano()
 	u.mu.Lock()
 	u.connCount++
 	u.ips[sourceIP]++
+	if u.act == nil {
+		u.act = make(map[string]*atomic.Int64)
+	}
+	cell := u.act[sourceIP]
+	if cell == nil {
+		cell = new(atomic.Int64)
+		u.act[sourceIP] = cell
+	}
+	cell.Store(now)
 	u.mu.Unlock()
+	return cell
 }
 
 // removeConn unregisters a connection from sourceIP.
@@ -55,9 +74,35 @@ func (u *userStats) removeConn(sourceIP string) {
 	u.ips[sourceIP]--
 	if u.ips[sourceIP] <= 0 {
 		delete(u.ips, sourceIP)
+		delete(u.act, sourceIP)
 		u.markDeparted(sourceIP, time.Now())
 	}
 	u.mu.Unlock()
+}
+
+// activeIPs returns the IPs, with their connection counts, that connected or
+// sent data within window of now. An IP with connections but no activity
+// stamp counts as active. The caller holds u.mu.
+func (u *userStats) activeIPs(now time.Time, window time.Duration) map[string]int {
+	cutoff := now.Add(-window).UnixNano()
+	active := make(map[string]int, len(u.ips))
+	for ip, n := range u.ips {
+		if cell := u.act[ip]; cell == nil || cell.Load() >= cutoff {
+			active[ip] = n
+		}
+	}
+	return active
+}
+
+// touchActivity marks the IP behind cell as active now. Stamps newer than a
+// second are left alone, so busy connections do not hammer one cache line.
+func touchActivity(cell *atomic.Int64) {
+	if cell == nil {
+		return
+	}
+	if now := time.Now().UnixNano(); now-cell.Load() > int64(time.Second) {
+		cell.Store(now)
+	}
 }
 
 // markDeparted records that sourceIP just went offline here and forgets
@@ -108,15 +153,20 @@ func releaseIPSnapshot(m map[string]struct{}) {
 	ipPool.Put(m)
 }
 
-// aliveIPList returns the set of alive IPs as a boolean map (for reporting).
+// aliveIPList returns the set of active IPs as a boolean map (for reporting).
+// It returns nil when the user has no connections. When connections exist but
+// none of their IPs is active, it returns an empty, non-nil set: reporting
+// that empty set is what makes the panel drop the user's stale entries for
+// this node.
 func (u *userStats) aliveIPList() map[string]bool {
-	u.mu.Lock()
-	defer u.mu.Unlock()
+	u.mu.RLock()
+	defer u.mu.RUnlock()
 	if len(u.ips) == 0 {
 		return nil
 	}
-	result := make(map[string]bool, len(u.ips))
-	for ip := range u.ips {
+	active := u.activeIPs(time.Now(), deviceActiveWindow)
+	result := make(map[string]bool, len(active))
+	for ip := range active {
 		result[ip] = true
 	}
 	return result
@@ -303,8 +353,9 @@ func (t *ConnTracker) RoutedConnection(
 	}
 
 	// Register connection
+	var act *atomic.Int64
 	if us != nil {
-		us.addConn(sourceIP)
+		act = us.addConn(sourceIP)
 	}
 
 	connID := t.nextID()
@@ -315,6 +366,7 @@ func (t *ConnTracker) RoutedConnection(
 		Conn:        conn,
 		tracker:     t,
 		us:          us,
+		act:         act,
 		userID:      uid,
 		connID:      connID,
 		sourceIP:    sourceIP,
@@ -356,8 +408,9 @@ func (t *ConnTracker) RoutedPacketConnection(
 		}
 	}
 
+	var act *atomic.Int64
 	if us != nil {
-		us.addConn(sourceIP)
+		act = us.addConn(sourceIP)
 	}
 
 	connID := t.nextID()
@@ -368,6 +421,7 @@ func (t *ConnTracker) RoutedPacketConnection(
 		PacketConn:  conn,
 		tracker:     t,
 		us:          us,
+		act:         act,
 		userID:      uid,
 		connID:      connID,
 		sourceIP:    sourceIP,
@@ -411,11 +465,13 @@ func (t *ConnTracker) checkDeviceGate(us *userStats, userID int, sourceIP string
 
 	us.mu.RLock()
 	defer us.mu.RUnlock()
-	if kernel.AdmitDevice(us.ips, t.devicesElsewhere(us, userID), sourceIP, limit) {
+	// Only IPs active within deviceActiveWindow count against the limit.
+	local := us.activeIPs(time.Now(), deviceActiveWindow)
+	if kernel.AdmitDevice(local, t.devicesElsewhere(us, userID), sourceIP, limit) {
 		return false
 	}
 	nlog.Core().Debug("device limit: over limit, rejecting",
-		"userID", userID, "ip", sourceIP, "localIPs", len(us.ips), "limit", limit)
+		"userID", userID, "ip", sourceIP, "localIPs", len(local), "limit", limit)
 	return true
 }
 
@@ -462,7 +518,7 @@ func (t *ConnTracker) disconnectOverLimit() {
 			continue
 		}
 		us.mu.RLock()
-		ips := kernel.OverLimitDevices(us.ips, t.devicesElsewhere(us, uid), limit)
+		ips := kernel.OverLimitDevices(us.activeIPs(time.Now(), deviceActiveWindow), t.devicesElsewhere(us, uid), limit)
 		us.mu.RUnlock()
 		for _, ip := range ips {
 			if over[uid] == nil {
@@ -653,8 +709,9 @@ func (r *RateLimitedReadCloser) Read(b []byte) (int, error) {
 type trackedConn struct {
 	net.Conn
 	tracker  *ConnTracker
-	us       *userStats // per-user stats (upload/download atomics + IP tracking)
-	userID   int        // user ID for device tracking
+	us       *userStats    // per-user stats (upload/download atomics + IP tracking)
+	act      *atomic.Int64 // activity stamp of sourceIP (nil without us)
+	userID   int           // user ID for device tracking
 	connID   string
 	sourceIP string
 	// upLimiter throttles reads (user upload), downLimiter writes (download).
@@ -672,6 +729,7 @@ func (c *trackedConn) Read(b []byte) (int, error) {
 	}
 	n, err := c.Conn.Read(b)
 	if n > 0 {
+		touchActivity(c.act)
 		if c.us != nil {
 			c.us.upload.Add(int64(n)) // 从入站读取 = 用户上传
 		}
@@ -765,7 +823,12 @@ func (c *trackedConn) UnwrapReader() (io.Reader, []N.CountFunc) {
 	if c.us == nil {
 		return c.Conn, nil
 	}
-	return c.Conn, []N.CountFunc{c.makeCountFunc(&c.us.upload, c.upLimiter)} // 从入站读取 = 用户上传
+	// Zero-copy relaying bypasses Read, so client data is also stamped here.
+	count := c.makeCountFunc(&c.us.upload, c.upLimiter) // 从入站读取 = 用户上传
+	return c.Conn, []N.CountFunc{func(n int64) {
+		touchActivity(c.act)
+		count(n)
+	}}
 }
 
 func (c *trackedConn) UnwrapWriter() (io.Writer, []N.CountFunc) {
@@ -785,6 +848,7 @@ type trackedPacketConn struct {
 	N.PacketConn
 	tracker  *ConnTracker
 	us       *userStats
+	act      *atomic.Int64 // activity stamp of sourceIP (nil without us)
 	userID   int
 	connID   string
 	sourceIP string
@@ -798,6 +862,7 @@ type trackedPacketConn struct {
 func (c *trackedPacketConn) ReadPacket(buffer *buf.Buffer) (singM.Socksaddr, error) {
 	dest, err := c.PacketConn.ReadPacket(buffer)
 	if err == nil {
+		touchActivity(c.act)
 		n := int64(buffer.Len())
 		if c.us != nil {
 			c.us.upload.Add(n) // 从入站读取 = 用户上传
@@ -888,7 +953,13 @@ func (c *trackedPacketConn) UnwrapPacketReader() (N.PacketReader, []N.CountFunc)
 	if c.us == nil {
 		return c.PacketConn, nil
 	}
-	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.download, c.upLimiter)}
+	// Zero-copy relaying bypasses ReadPacket, so client packets are also
+	// stamped here.
+	count := c.makeCountFunc(&c.us.download, c.upLimiter)
+	return c.PacketConn, []N.CountFunc{func(n int64) {
+		touchActivity(c.act)
+		count(n)
+	}}
 }
 
 func (c *trackedPacketConn) UnwrapPacketWriter() (N.PacketWriter, []N.CountFunc) {

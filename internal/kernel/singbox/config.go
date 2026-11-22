@@ -439,6 +439,11 @@ func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert)
 		"tag":         inboundTag(nc),
 		"listen":      "::",
 		"listen_port": nc.ServerPort,
+		// Safety net for the device activity window: probe idle TCP
+		// connections after 180s and every 30s, so dead paths close in
+		// minutes instead of sing-box's default 5m + 75s probes (about 16m).
+		"tcp_keep_alive":          "180s",
+		"tcp_keep_alive_interval": "30s",
 	}
 
 	switch nc.Protocol {

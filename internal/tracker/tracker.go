@@ -102,10 +102,14 @@ func (t *Tracker) Process(
 		}
 	}
 
-	// Compute online from alive IPs.
+	// Compute online from alive IPs. A user whose connections are all idle
+	// carries an empty set, which still reaches the panel as an empty device
+	// list, but is not counted online.
 	online := make(map[int]int, len(kernelAliveIPs))
 	for uid, ips := range kernelAliveIPs {
-		online[uid] = len(ips)
+		if len(ips) > 0 {
+			online[uid] = len(ips)
+		}
 	}
 
 	// Publish new snapshot (readers will see this atomically).
