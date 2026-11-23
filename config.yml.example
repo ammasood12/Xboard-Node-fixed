@@ -30,7 +30,7 @@
 #   rest_polling_with_websocket: true   # true = keep REST polling while the websocket is connected
 
 # ── Device limit (sing-box kernel only; every key is optional) ──
-# The defaults below behave like fixed3 and never block anyone.
+# The limit itself comes from the panel (per user / package). Defaults: fixed3 counting, enforced after a short delay.
 # device_limit:
 #   count_method: recent_connection     # recent_connection | traffic | off
 #   #   recent_connection = an IP is a device while its client sent data within recent_connection_seconds
@@ -40,7 +40,8 @@
 #   min_traffic_kb: 100                 # used by traffic
 #   traffic_check_seconds: 60           # used by traffic; multiple of 10, 10..120
 #   ipv4_ipv6_counting: separate        # separate | merge (merge: devices = max(IPv4 devices, IPv6 devices))
-#   block_devices: false                # false = never reject or disconnect; true = really block
+#   block_devices: true                 # true = enforce the device limit the panel sets per user/package (users without a panel limit are never touched)
+#                                       # false = only count and log (test run), never reject or disconnect
 #   log_over_limit_devices: true        # log every device found over the limit (rate limited per user)
 #   reject_new_device_immediately: false  # true = refuse a new IP at once when the limit is full
 #   over_limit_kick_after_minutes: 5    # kick only if over the limit this long ... (0 = kick at once)

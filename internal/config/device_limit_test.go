@@ -14,8 +14,8 @@ func TestDeviceLimitDefaults(t *testing.T) {
 	if r.MinTrafficBytes != 100*1024 || r.TrafficCheckSeconds != 60 {
 		t.Errorf("traffic defaults %d / %d", r.MinTrafficBytes, r.TrafficCheckSeconds)
 	}
-	if r.Block || r.Merge || r.RejectNewImmediately {
-		t.Errorf("blocking/merge defaults must be off: %+v", r)
+	if !r.Block || r.Merge || r.RejectNewImmediately {
+		t.Errorf("blocking must default on (the panel limit decides), merge and immediate reject off: %+v", r)
 	}
 	if !r.LogOverLimit || !r.ClearPanelWhenUserIdle {
 		t.Errorf("log and clear-idle defaults must be on: %+v", r)
@@ -30,9 +30,9 @@ func TestDeviceLimitDefaults(t *testing.T) {
 
 func TestDeviceLimitExplicitZeroAndFalseAreKept(t *testing.T) {
 	zero, f := 0, false
-	c := &DeviceLimitConfig{OverLimitKickAfterMinutes: &zero, TCPKeepaliveSeconds: &zero, LogOverLimitDevices: &f, ClearPanelWhenUserIdle: &f}
+	c := &DeviceLimitConfig{BlockDevices: &f, OverLimitKickAfterMinutes: &zero, TCPKeepaliveSeconds: &zero, LogOverLimitDevices: &f, ClearPanelWhenUserIdle: &f}
 	r := c.Runtime()
-	if r.KickAfter != 0 || r.TCPKeepaliveSeconds != 0 || r.LogOverLimit || r.ClearPanelWhenUserIdle {
+	if r.Block || r.KickAfter != 0 || r.TCPKeepaliveSeconds != 0 || r.LogOverLimit || r.ClearPanelWhenUserIdle {
 		t.Errorf("explicit zero/false overridden by defaults: %+v", r)
 	}
 	s := &SyncConfig{RESTPollingWithWebsocket: &f}
@@ -102,7 +102,7 @@ func TestIgnored(t *testing.T) {
 }
 
 func TestSummary(t *testing.T) {
-	r := (&DeviceLimitConfig{CountMethod: "traffic", IPv4IPv6Counting: "merge", BlockDevices: true}).Runtime()
+	r := (&DeviceLimitConfig{CountMethod: "traffic", IPv4IPv6Counting: "merge"}).Runtime()
 	s := r.Summary()
 	for _, want := range []string{"method=traffic", "min=100KB/60s", "ipv4_ipv6=merge", "block=true", "kick_after=5m/10m"} {
 		if !strings.Contains(s, want) {

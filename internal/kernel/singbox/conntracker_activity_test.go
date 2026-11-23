@@ -15,12 +15,14 @@ const deviceMinBytes = 100 * kb
 
 func intp(v int) *int { return &v }
 
+func boolp(v bool) *bool { return &v }
+
 // trafficRule is the fixed4 rule with the old immediate behaviour: count by
 // traffic, reject new devices at once, kick at once, really block.
 func trafficRule() config.DeviceRuntime {
 	return (&config.DeviceLimitConfig{
 		CountMethod:                config.CountTraffic,
-		BlockDevices:               true,
+		BlockDevices:               boolp(true),
 		RejectNewDeviceImmediately: true,
 		OverLimitKickAfterMinutes:  intp(0),
 	}).Runtime()

@@ -55,7 +55,7 @@ instances:
 }
 
 func TestInstancesInheritDeviceLimit(t *testing.T) {
-	parent := &Config{DeviceLimit: &DeviceLimitConfig{BlockDevices: true}, Sync: &SyncConfig{}}
+	parent := &Config{DeviceLimit: &DeviceLimitConfig{IPv4IPv6Counting: "merge"}, Sync: &SyncConfig{}}
 	own := &Config{DeviceLimit: &DeviceLimitConfig{CountMethod: "off"}}
 	inherit := &Config{}
 	own.inheritFrom(parent)
@@ -63,7 +63,7 @@ func TestInstancesInheritDeviceLimit(t *testing.T) {
 	if own.DeviceLimit.CountMethod != "off" {
 		t.Error("instance override replaced by the parent")
 	}
-	if inherit.DeviceLimit == nil || !inherit.DeviceLimit.BlockDevices {
+	if inherit.DeviceLimit == nil || !inherit.DeviceLimit.Runtime().Merge {
 		t.Error("instance did not inherit device_limit")
 	}
 	if inherit.Sync == nil {

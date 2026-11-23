@@ -48,8 +48,9 @@ func (c *SyncConfig) RESTPolling() bool {
 
 // DeviceLimitConfig selects how devices are counted and what happens to
 // devices over a user's limit. It applies to the sing-box kernel; xray keeps
-// its own device handling. The zero value reproduces the fixed3 behaviour
-// with blocking off.
+// its own device handling. The limit itself always comes from the panel (per
+// user or package); with the zero value the node enforces it with fixed3
+// counting, after the delayed over-limit check.
 type DeviceLimitConfig struct {
 	// CountMethod: recent_connection | traffic | off. Default recent_connection.
 	CountMethod string `yaml:"count_method,omitempty"`
@@ -70,8 +71,10 @@ type DeviceLimitConfig struct {
 	IPv4IPv6Counting string `yaml:"ipv4_ipv6_counting,omitempty"`
 
 	// BlockDevices makes the node really reject and disconnect devices over
-	// the limit. false = only count (and log, see LogOverLimitDevices).
-	BlockDevices bool `yaml:"block_devices,omitempty"`
+	// the limit the panel sets for a user (package). Users without a panel
+	// device limit are never affected. false = only count (and log, see
+	// LogOverLimitDevices). nil = true: the admin panel decides.
+	BlockDevices *bool `yaml:"block_devices,omitempty"`
 
 	// LogOverLimitDevices logs every device found over the limit, including
 	// the action taken ("none" when BlockDevices is false). nil = true.
@@ -150,7 +153,7 @@ func (c *DeviceLimitConfig) Runtime() DeviceRuntime {
 		MinTrafficBytes:        int64(firstInt(c.MinTrafficKB, 100)) * 1024,
 		TrafficCheckSeconds:    firstInt(c.TrafficCheckSeconds, 60),
 		Merge:                  c.IPv4IPv6Counting == CountMerge,
-		Block:                  c.BlockDevices,
+		Block:                  boolOr(c.BlockDevices, true),
 		LogOverLimit:           boolOr(c.LogOverLimitDevices, true),
 		RejectNewImmediately:   c.RejectNewDeviceImmediately,
 		KickAfter:              time.Duration(intOr(c.OverLimitKickAfterMinutes, 5)) * time.Minute,
