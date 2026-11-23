@@ -220,6 +220,17 @@ func LoadRoot(path string) (*RootConfig, error) {
 		return nil, fmt.Errorf("read config file: %w", err)
 	}
 
+	// device_config.yml (optional, next to config.yml) overrides the built-in
+	// sync / device-limit defaults; instances without their own block inherit it.
+	if used, problems := rc.ApplyDeviceFile(path); used || len(problems) > 0 {
+		for _, msg := range problems {
+			nlog.Core().Warn("config: " + msg)
+		}
+		if used {
+			nlog.Core().Info("device_config.yml in use", "path", DeviceConfigPath(path))
+		}
+	}
+
 	// In multi-instance mode, top-level settings (log, kernel, node, ws, etc.)
 	// serve as defaults that each instance inherits. Instance-level settings
 	// take precedence over top-level ones.

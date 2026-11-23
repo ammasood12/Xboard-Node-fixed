@@ -109,10 +109,19 @@ func (w *Watcher) loop(ctx context.Context) {
 			if !ok {
 				return
 			}
-			if filepath.Clean(ev.Name) != w.path {
-				continue
-			}
-			if !ev.Has(fsnotify.Write) && !ev.Has(fsnotify.Create) {
+			name := filepath.Clean(ev.Name)
+			switch name {
+			case w.path:
+				if !ev.Has(fsnotify.Write) && !ev.Has(fsnotify.Create) {
+					continue
+				}
+			case DeviceConfigPath(w.path):
+				// device_config.yml: also react to it being removed or renamed
+				// away (xbctl config device disable).
+				if !ev.Has(fsnotify.Write) && !ev.Has(fsnotify.Create) && !ev.Has(fsnotify.Remove) && !ev.Has(fsnotify.Rename) {
+					continue
+				}
+			default:
 				continue
 			}
 

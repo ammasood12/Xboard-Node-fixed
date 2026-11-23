@@ -70,6 +70,10 @@ type fileInstance struct {
 	Cert       *config.CertConfig `yaml:"cert,omitempty"`
 	WS         *config.WSConfig   `yaml:"ws,omitempty"`
 	Nodes      []config.NodeEntry `yaml:"nodes,omitempty"`
+
+	// Per-instance sync: / device_limit: overrides must survive a rewrite.
+	Sync        *config.SyncConfig        `yaml:"sync,omitempty"`
+	DeviceLimit *config.DeviceLimitConfig `yaml:"device_limit,omitempty"`
 }
 
 type filePanelConfig struct {
@@ -205,6 +209,8 @@ func printUsage() {
   xbctl config init --mode node|machine --panel-url URL --token TOKEN [flags]
   xbctl config health-port [--config PATH]
   xbctl config device [--config PATH]   show effective sync/device_limit settings
+  xbctl config device enable            turn on device_config.yml (suggested values, commented); restores your saved copy if there is one
+  xbctl config device disable           turn it off (kept as device_config.yml.off); the built-in defaults apply
   xbctl service status|start|stop|restart|enable|disable|logs
   xbctl health
   xbctl bind add-node --panel-url URL --token TOKEN --node-id ID [--node-type TYPE] [--kernel singbox|xray]
@@ -926,6 +932,10 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 		if len(inst.Nodes) > 0 {
 			fi.Nodes = inst.Nodes
 		}
+		if len(root.Instances) > 0 { // legacy single-config mode has no per-instance blocks
+			fi.Sync = inst.Sync
+			fi.DeviceLimit = inst.DeviceLimit
+		}
 		out.Instances = append(out.Instances, fi)
 	}
 	data, err := yaml.Marshal(&out)
@@ -1537,11 +1547,30 @@ func writeInstallMetaVersioned(path string, root *config.RootConfig, ver, latest
 // It reads the file only; it does not talk to the running node.
 func runConfigDevice(args []string) error {
 	cfgPath := defaultConfigPath
+	action := ""
 	for i := 0; i < len(args); i++ {
-		if args[i] == "--config" && i+1 < len(args) {
+		switch {
+		case args[i] == "--config" && i+1 < len(args):
 			i++
 			cfgPath = args[i]
+		case args[i] == "enable" || args[i] == "disable":
+			action = args[i]
+		default:
+			return fmt.Errorf("unknown argument %q (use: enable, disable, --config PATH)", args[i])
 		}
+	}
+	if action != "" {
+		var path, msg string
+		var aerr error
+		if action == "enable" {
+			path, msg, aerr = config.EnableDeviceFile(cfgPath)
+		} else {
+			path, msg, aerr = config.DisableDeviceFile(cfgPath)
+		}
+		if aerr != nil {
+			return fmt.Errorf("%s device_config.yml: %w", action, aerr)
+		}
+		fmt.Printf("%s: %s\n", path, msg)
 	}
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
@@ -1551,7 +1580,20 @@ func runConfigDevice(args []string) error {
 	if err := yaml.Unmarshal(data, root); err != nil {
 		return fmt.Errorf("parse %s: %w", cfgPath, err)
 	}
+	used, fileProblems := root.ApplyDeviceFile(cfgPath)
+	devPath := config.DeviceConfigPath(cfgPath)
 	fmt.Printf("config: %s\n", cfgPath)
+	if used {
+		fmt.Printf("device_config.yml: ON (%s)\n", devPath)
+	} else {
+		fmt.Println("device_config.yml: OFF, built-in defaults apply (turn on: xbctl config device enable)")
+		if _, serr := os.Stat(devPath + ".off"); serr == nil {
+			fmt.Printf("  a saved copy exists (%s.off); enable restores it\n", devPath)
+		}
+	}
+	for _, msg := range fileProblems {
+		fmt.Printf("PROBLEM: %s\n", msg)
+	}
 	show := func(label string, sync *config.SyncConfig, dev *config.DeviceLimitConfig) {
 		fmt.Printf("%s\n", label)
 		fmt.Printf("  rest_polling_with_websocket=%t\n", sync.RESTPolling())

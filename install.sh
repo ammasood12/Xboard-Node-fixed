@@ -628,6 +628,10 @@ backup_existing_state() {
     if [ -f "$CREDENTIALS_FILE" ]; then
         cp "$CREDENTIALS_FILE" "$BACKUP_PATH/credentials.env"
     fi
+    # Optional device-limit overrides; the installer never creates or changes this file.
+    if [ -f "${INSTALL_ROOT}/device_config.yml" ]; then
+        cp "${INSTALL_ROOT}/device_config.yml" "$BACKUP_PATH/device_config.yml"
+    fi
     if [ -f "$INSTALL_META" ]; then
         cp "$INSTALL_META" "$BACKUP_PATH/install-meta.json"
     fi

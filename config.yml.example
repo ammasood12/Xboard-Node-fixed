@@ -49,4 +49,11 @@
 #   tcp_keepalive_seconds: 180          # close dead client sockets (0 = off)
 #   clear_panel_when_user_idle: true    # idle user reports an empty device list so the panel drops old entries
 #   ignore_ips: []                      # IPs or CIDRs that never count and are never blocked (relays)
+# Recommended: leave config.yml alone and use the separate file device_config.yml instead.
+#   xbctl config device enable    writes it next to config.yml (suggested values, a comment on every key)
+#   xbctl config device disable   turns it off again (kept as device_config.yml.off)
+# Without that file the built-in defaults above apply. A top-level block in this file still works,
+# but device_config.yml replaces it while that file exists; a per-instance block always wins.
 # Check what a node will use:  xbctl config device
+# Write these blocks (with explanations) into the node's config.yml:  xbctl config device --init
+#   (the installer and "xbctl upgrade" do this automatically; blocks that already exist are never changed)
