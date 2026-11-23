@@ -4,6 +4,8 @@ import (
 	"context"
 	"io"
 	"net"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,6 +16,7 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"golang.org/x/time/rate"
 
+	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 )
@@ -41,53 +44,87 @@ type userStats struct {
 	departed  map[string]time.Time   // sourceIP → when it last went offline here
 }
 
-// An IP counts as a device only while it moves real traffic: at least
-// deviceMinBytes in the last ~deviceBucketN*deviceBucketDur (60 s). Open but
-// quiet sockets (dead paths after a network switch, idle keepalives, the
-// trickle of a carrier-NAT pool IP) move far less and so do not count, and a
-// bare new connection is not activity either. This mirrors V2bX's
-// DeviceOnlineMinTraffic (100 KB). It only decides which IPs are devices;
-// traffic accounting is unchanged.
+// What counts as an active device is chosen by device_limit.count_method:
+//
+//   - recent_connection: an IP is a device while its client sent any data (or
+//     connected) within recent_connection_seconds (fixed3).
+//   - traffic: an IP is a device only while it moved at least min_traffic_kb
+//     within traffic_check_seconds (fixed4). Open but quiet sockets (dead paths
+//     after a network switch, idle keepalives, the trickle of a carrier-NAT
+//     pool IP) move far less and so do not count, and a bare new connection is
+//     not activity either. This mirrors V2bX's DeviceOnlineMinTraffic.
+//   - off: every connected IP is a device.
+//
+// It only decides which IPs are devices; traffic accounting is unchanged.
 const (
 	deviceBucketDur = 10 * time.Second
-	deviceBucketN   = 6
-	deviceMinBytes  = 100 * 1024
+	// deviceBucketMax is the longest traffic window kept: 12 buckets = 120 s.
+	deviceBucketMax = 12
+	// deviceSampleEvery is how often every user's device count is sampled for
+	// the delayed over-limit check.
+	deviceSampleEvery = 30 * time.Second
+	// deviceLogEvery rate-limits the over-limit log lines per user.
+	deviceLogEvery = 5 * time.Minute
 )
 
-// ipActivity is a sliding byte window for one source IP: deviceBucketN buckets
-// of deviceBucketDur each (the current partial bucket plus the previous
-// deviceBucketN-1, so 50-60 s). Lock-free: it is updated on every read and
-// write of every connection from the IP.
+// ipActivity records what one source IP has done recently: a sliding byte
+// window of deviceBucketDur buckets (for count_method traffic) and the time
+// its client last sent data or connected (for count_method recent_connection).
+// Lock-free: it is updated on every read and write of every connection from
+// the IP.
 type ipActivity struct {
-	stamp [deviceBucketN]atomic.Int64 // bucket index each slot currently holds
-	bytes [deviceBucketN]atomic.Int64 // bytes moved in that bucket
+	stamp    [deviceBucketMax]atomic.Int64 // bucket index each slot currently holds
+	bytes    [deviceBucketMax]atomic.Int64 // bytes moved in that bucket
+	lastRead atomic.Int64                  // unix nanos of the last client data or connect
 }
 
-// add records n bytes moved now. Safe on a nil receiver.
-func (a *ipActivity) add(n int64) { a.addAt(n, time.Now()) }
+// add records n bytes the client sent now. Safe on a nil receiver.
+func (a *ipActivity) add(n int64) { a.addAt(n, time.Now(), true) }
 
-func (a *ipActivity) addAt(n int64, now time.Time) {
+// addWrite records n bytes sent to the client now. Safe on a nil receiver.
+func (a *ipActivity) addWrite(n int64) { a.addAt(n, time.Now(), false) }
+
+func (a *ipActivity) addAt(n int64, now time.Time, fromClient bool) {
 	if a == nil || n <= 0 {
 		return
 	}
+	if fromClient {
+		a.lastRead.Store(now.UnixNano())
+	}
 	idx := now.UnixNano() / int64(deviceBucketDur)
-	i := int(idx % deviceBucketN)
+	i := int(idx % deviceBucketMax)
 	if old := a.stamp[i].Load(); old != idx && a.stamp[i].CompareAndSwap(old, idx) {
 		a.bytes[i].Store(0) // slot held an expired bucket
 	}
 	a.bytes[i].Add(n)
 }
 
-// sumAt returns the bytes moved within the window ending at now.
-func (a *ipActivity) sumAt(now time.Time) int64 {
+// touch marks the IP as active now without any bytes (a new connection).
+func (a *ipActivity) touch(now time.Time) {
+	if a != nil {
+		a.lastRead.Store(now.UnixNano())
+	}
+}
+
+// sumAt returns the bytes moved within the last buckets buckets (the current
+// partial bucket plus the previous buckets-1).
+func (a *ipActivity) sumAt(now time.Time, buckets int) int64 {
+	if buckets <= 0 || buckets > deviceBucketMax {
+		buckets = deviceBucketMax
+	}
 	idx := now.UnixNano() / int64(deviceBucketDur)
 	var sum int64
 	for i := range a.stamp {
-		if s := a.stamp[i].Load(); s > idx-deviceBucketN && s <= idx {
+		if s := a.stamp[i].Load(); s > idx-int64(buckets) && s <= idx {
 			sum += a.bytes[i].Load()
 		}
 	}
 	return sum
+}
+
+// idleFor returns how long ago the client last sent data or connected.
+func (a *ipActivity) idleFor(now time.Time) time.Duration {
+	return now.Sub(time.Unix(0, a.lastRead.Load()))
 }
 
 // addConn registers a new connection from sourceIP and returns the IP's
@@ -104,6 +141,7 @@ func (u *userStats) addConn(sourceIP string) *ipActivity {
 		cell = new(ipActivity)
 		u.act[sourceIP] = cell
 	}
+	cell.touch(time.Now())
 	u.mu.Unlock()
 	return cell
 }
@@ -121,14 +159,27 @@ func (u *userStats) removeConn(sourceIP string) {
 	u.mu.Unlock()
 }
 
-// activeIPs returns the IPs, with their connection counts, that moved at least
-// deviceMinBytes in the current window. An IP with connections but no activity
-// window counts as active. The caller holds u.mu.
-func (u *userStats) activeIPs(now time.Time) map[string]int {
+// activeIPs returns the IPs, with their connection counts, that count as
+// devices under rule r. An IP with connections but no activity record counts
+// as active. IPs in device_limit.ignore_ips never count. The caller holds u.mu.
+func (u *userStats) activeIPs(now time.Time, r *config.DeviceRuntime) map[string]int {
 	active := make(map[string]int, len(u.ips))
 	for ip, n := range u.ips {
-		if cell := u.act[ip]; cell == nil || cell.sumAt(now) >= deviceMinBytes {
+		if r.Ignored(ip) {
+			continue
+		}
+		cell := u.act[ip]
+		switch {
+		case r.CountMethod == config.CountOff, cell == nil:
 			active[ip] = n
+		case r.CountMethod == config.CountTraffic:
+			if cell.sumAt(now, r.TrafficCheckSeconds/10) >= r.MinTrafficBytes {
+				active[ip] = n
+			}
+		default: // recent_connection
+			if cell.idleFor(now) <= r.RecentConnection {
+				active[ip] = n
+			}
 		}
 	}
 	return active
@@ -184,16 +235,19 @@ func releaseIPSnapshot(m map[string]struct{}) {
 
 // aliveIPList returns the set of active IPs as a boolean map (for reporting).
 // It returns nil when the user has no connections. When connections exist but
-// none of their IPs is active, it returns an empty, non-nil set: reporting
+// none of their IPs is active, it returns an empty, non-nil set (reporting
 // that empty set is what makes the panel drop the user's stale entries for
-// this node.
-func (u *userStats) aliveIPList() map[string]bool {
+// this node), or nil when device_limit.clear_panel_when_user_idle is off.
+func (u *userStats) aliveIPList(r *config.DeviceRuntime) map[string]bool {
 	u.mu.RLock()
 	defer u.mu.RUnlock()
 	if len(u.ips) == 0 {
 		return nil
 	}
-	active := u.activeIPs(time.Now())
+	active := u.activeIPs(time.Now(), r)
+	if len(active) == 0 && !r.ClearPanelWhenUserIdle {
+		return nil
+	}
 	result := make(map[string]bool, len(active))
 	for ip := range active {
 		result[ip] = true
@@ -239,6 +293,22 @@ type ConnTracker struct {
 	globalDevices    map[int]map[string]bool // userID → IP → exists
 	globalMu         sync.RWMutex
 	globalLastUpdate time.Time
+
+	// rule is the device counting/blocking configuration (device_limit:).
+	rule atomic.Pointer[config.DeviceRuntime]
+
+	// Delayed over-limit check: devMu guards overHist (per user, one entry per
+	// deviceSampleEvery sample: was the user over the limit), lastSample and
+	// lastLog (rate limit of the over-limit log lines).
+	devMu      sync.Mutex
+	overHist   map[int][]bool
+	lastSample time.Time
+	lastLog    map[logKey]time.Time
+}
+
+type logKey struct {
+	uid  int
+	kind string
 }
 
 // NewConnTracker creates a tracker.
@@ -248,7 +318,25 @@ func NewConnTracker(_ int) *ConnTracker {
 		uuidMap:       make(map[string]int),
 		connMap:       make(map[string]trackedRef),
 		globalDevices: make(map[int]map[string]bool),
+		overHist:      make(map[int][]bool),
+		lastLog:       make(map[logKey]time.Time),
 	}
+}
+
+// SetDeviceConfig sets the device counting and blocking rule (device_limit:).
+func (t *ConnTracker) SetDeviceConfig(r config.DeviceRuntime) {
+	t.rule.Store(&r)
+}
+
+// deviceRule returns the current rule; the defaults (fixed3 counting,
+// blocking off) when none was set.
+func (t *ConnTracker) deviceRule() *config.DeviceRuntime {
+	if r := t.rule.Load(); r != nil {
+		return r
+	}
+	r := (*config.DeviceLimitConfig)(nil).Runtime()
+	t.rule.CompareAndSwap(nil, &r)
+	return t.rule.Load()
 }
 
 // trackedRef is a live connection as seen by force-close and revocation.
@@ -484,32 +572,49 @@ func (t *ConnTracker) register(connID string, conn io.Closer, metadata adapter.I
 // globalDevicesTTL is how long panel-pushed device state stays usable.
 const globalDevicesTTL = 60 * time.Second
 
-// checkDeviceGate rejects connections exceeding device limit. An IP already
-// online here or on another node is kept; a new IP is admitted only while
-// fewer than limit are online, first come first served.
+// checkDeviceGate reports whether a new connection from sourceIP must be
+// rejected. An IP already online here or on another node is always kept. A new
+// IP that would exceed the limit is rejected at once with
+// reject_new_device_immediately, otherwise only while the user has been over
+// the limit for a while (see persistentlyOver). With block_devices off nothing
+// is rejected; the would-be rejection is only logged.
 func (t *ConnTracker) checkDeviceGate(us *userStats, userID int, sourceIP string, limit int) bool {
-	if us == nil || limit <= 0 {
+	r := t.deviceRule()
+	if us == nil || limit <= 0 || r.CountMethod == config.CountOff || r.Ignored(sourceIP) {
 		return false
 	}
 
 	us.mu.RLock()
-	defer us.mu.RUnlock()
-	// Only IPs that moved at least deviceMinBytes recently count against the limit.
-	local := us.activeIPs(time.Now())
-	if kernel.AdmitDevice(local, t.devicesElsewhere(us, userID), sourceIP, limit) {
+	now := time.Now()
+	local := us.activeIPs(now, r)
+	elsewhere := t.devicesElsewhere(us, userID, r)
+	us.mu.RUnlock()
+
+	admit := kernel.AdmitDevice(local, elsewhere, sourceIP, limit)
+	if r.Merge {
+		admit = kernel.AdmitDeviceMerged(local, elsewhere, sourceIP, limit)
+	}
+	if admit {
 		return false
 	}
-	nlog.Core().Debug("device limit: over limit, rejecting",
-		"userID", userID, "ip", sourceIP, "localIPs", len(local), "limit", limit)
-	return true
+	if !r.RejectNewImmediately && !t.persistentlyOver(userID, r) {
+		return false
+	}
+	action := "none"
+	if r.Block {
+		action = "rejected"
+	}
+	t.logOverLimit(userID, "reject", r, local, elsewhere, limit, sourceIP, action)
+	return r.Block
 }
 
 // devicesElsewhere returns the user's IPs online on other nodes, from the
 // panel's global state while it is fresh. That state includes the devices
 // this node reported and trails them, so an IP that left this node less than
 // kernel.DeviceEchoWindow before the state arrived is taken for an echo of
-// this node's own report and left out. The caller holds us.mu.
-func (t *ConnTracker) devicesElsewhere(us *userStats, userID int) map[string]bool {
+// this node's own report and left out. Ignored IPs are left out too. The
+// caller holds us.mu.
+func (t *ConnTracker) devicesElsewhere(us *userStats, userID int, r *config.DeviceRuntime) map[string]bool {
 	t.globalMu.RLock()
 	received := t.globalLastUpdate
 	global := t.globalDevices[userID]
@@ -517,11 +622,17 @@ func (t *ConnTracker) devicesElsewhere(us *userStats, userID int) map[string]boo
 	if time.Since(received) > globalDevicesTTL {
 		return nil
 	}
-	if len(global) == 0 || len(us.departed) == 0 {
+	if len(global) == 0 {
+		return global
+	}
+	if len(us.departed) == 0 && len(r.IgnorePrefixes) == 0 {
 		return global
 	}
 	elsewhere := make(map[string]bool, len(global))
 	for ip := range global {
+		if r.Ignored(ip) {
+			continue
+		}
 		if left, ok := us.departed[ip]; ok && received.Before(left.Add(kernel.DeviceEchoWindow)) {
 			continue
 		}
@@ -530,35 +641,185 @@ func (t *ConnTracker) devicesElsewhere(us *userStats, userID int) map[string]boo
 	return elsewhere
 }
 
+// persistentlyOver reports whether the user was over the limit in enough of
+// the recent samples to be kicked: samples covering at least
+// over_limit_kick_after_minutes within the last over_limit_watch_minutes. With over_limit_kick_after_minutes 0 the delay is
+// off and this is always false (the kick check then needs no history).
+func (t *ConnTracker) persistentlyOver(uid int, r *config.DeviceRuntime) bool {
+	if r.KickAfter <= 0 {
+		return false
+	}
+	need := int(r.KickAfter / deviceSampleEvery)
+	t.devMu.Lock()
+	defer t.devMu.Unlock()
+	hits := 0
+	for _, over := range t.overHist[uid] {
+		if over {
+			hits++
+		}
+	}
+	return hits >= need
+}
+
+// sampleDevices records, once per deviceSampleEvery, whether each user is over
+// the limit, then applies the over-limit check. It runs from GetUserTraffic,
+// which the service calls every track interval. A user's history is the last
+// over_limit_watch_minutes of samples and is dropped once it holds no
+// over-the-limit sample, or after the user was kicked.
+func (t *ConnTracker) sampleDevices(now time.Time) {
+	r := t.deviceRule()
+	if r.CountMethod == config.CountOff {
+		return
+	}
+	t.devMu.Lock()
+	if !t.lastSample.IsZero() && now.Sub(t.lastSample) < deviceSampleEvery {
+		t.devMu.Unlock()
+		return
+	}
+	t.lastSample = now
+	t.devMu.Unlock()
+
+	dlf := t.deviceLimitFunc.Load()
+	if dlf == nil {
+		return
+	}
+	watch := int(r.Watch / deviceSampleEvery)
+	if watch < 1 {
+		watch = 1
+	}
+	overNow := make(map[int]bool) // sampled users: over the limit right now?
+	t.usersMu.RLock()
+	for uuid, uid := range t.uuidMap {
+		limit, hasLimit := (*dlf)(uuid)
+		us := t.users[uid]
+		if !hasLimit || limit <= 0 || us == nil {
+			continue
+		}
+		us.mu.RLock()
+		local := us.activeIPs(now, r)
+		elsewhere := t.devicesElsewhere(us, uid, r)
+		us.mu.RUnlock()
+		overNow[uid] = kernel.CountDevices(local, elsewhere, r.Merge) > limit
+	}
+	t.usersMu.RUnlock()
+
+	t.devMu.Lock()
+	for uid := range t.overHist {
+		if _, ok := overNow[uid]; !ok {
+			delete(t.overHist, uid)
+		}
+	}
+	for uid, over := range overNow {
+		h := append(t.overHist[uid], over)
+		if len(h) > watch {
+			h = h[len(h)-watch:]
+		}
+		any := false
+		for _, v := range h {
+			any = any || v
+		}
+		if any {
+			t.overHist[uid] = h
+		} else {
+			delete(t.overHist, uid)
+		}
+	}
+	t.devMu.Unlock()
+
+	t.disconnectOverLimit()
+}
+
+// logOverLimit writes one rate-limited line (per user and kind) describing a
+// device found over the limit and what was done about it.
+func (t *ConnTracker) logOverLimit(uid int, kind string, r *config.DeviceRuntime,
+	local map[string]int, elsewhere map[string]bool, limit int, ips, action string) {
+	if !r.LogOverLimit {
+		return
+	}
+	now := time.Now()
+	k := logKey{uid, kind}
+	t.devMu.Lock()
+	if last, ok := t.lastLog[k]; ok && now.Sub(last) < deviceLogEvery {
+		t.devMu.Unlock()
+		return
+	}
+	t.lastLog[k] = now
+	for key, at := range t.lastLog {
+		if now.Sub(at) > 2*deviceLogEvery {
+			delete(t.lastLog, key)
+		}
+	}
+	t.devMu.Unlock()
+	counting := config.CountSeparate
+	if r.Merge {
+		counting = config.CountMerge
+	}
+	nlog.Core().Info("singbox: device over the limit",
+		"user", uid, "ip", ips, "limit", limit, "action", action, "kind", kind,
+		"union", kernel.CountDevices(local, elsewhere, false),
+		"max", kernel.CountDevices(local, elsewhere, true),
+		"counting", counting)
+}
+
 // disconnectOverLimit closes the connections of local devices that put a
 // user over the device limit. Admission cannot prevent this alone: two nodes
 // can each admit a new device before the panel tells them about the other.
+// With over_limit_kick_after_minutes above 0 a user is only handled once it
+// has been over the limit for that long; with block_devices off the devices
+// are only logged.
 func (t *ConnTracker) disconnectOverLimit() {
 	dlf := t.deviceLimitFunc.Load()
 	if dlf == nil {
 		return
 	}
+	r := t.deviceRule()
+	if r.CountMethod == config.CountOff {
+		return
+	}
+	now := time.Now()
+	type found struct {
+		uid     int
+		ips     []string
+		limit   int
+		local   map[string]int
+		elsewhr map[string]bool
+	}
+	var hits []found
+
 	t.usersMu.RLock()
-	over := make(map[int]map[string]bool)
 	for uuid, uid := range t.uuidMap {
 		limit, hasLimit := (*dlf)(uuid)
 		us := t.users[uid]
-		if !hasLimit || us == nil {
+		if !hasLimit || limit <= 0 || us == nil {
 			continue
 		}
 		us.mu.RLock()
-		ips := kernel.OverLimitDevices(us.activeIPs(time.Now()), t.devicesElsewhere(us, uid), limit)
+		local := us.activeIPs(now, r)
+		elsewhere := t.devicesElsewhere(us, uid, r)
 		us.mu.RUnlock()
-		for _, ip := range ips {
-			if over[uid] == nil {
-				over[uid] = make(map[string]bool)
-			}
-			over[uid][ip] = true
-			nlog.Core().Info("singbox: disconnecting device over the limit", "user", uid, "ip", ip, "limit", limit)
+		var ips []string
+		if r.Merge {
+			ips = kernel.OverLimitDevicesMerged(local, elsewhere, limit)
+		} else {
+			ips = kernel.OverLimitDevices(local, elsewhere, limit)
+		}
+		if len(ips) == 0 {
+			continue
+		}
+		if r.KickAfter > 0 && !t.persistentlyOver(uid, r) {
+			continue
+		}
+		hits = append(hits, found{uid, ips, limit, local, elsewhere})
+	}
+	over := make(map[int]map[string]bool, len(hits))
+	for _, h := range hits {
+		over[h.uid] = make(map[string]bool, len(h.ips))
+		for _, ip := range h.ips {
+			over[h.uid][ip] = true
 		}
 	}
 	var revoked []io.Closer
-	if len(over) > 0 {
+	if r.Block && len(over) > 0 {
 		for _, ref := range t.connMap {
 			if over[ref.uid][ref.sourceIP] {
 				revoked = append(revoked, ref.conn)
@@ -567,9 +828,26 @@ func (t *ConnTracker) disconnectOverLimit() {
 	}
 	t.usersMu.RUnlock()
 
+	for _, h := range hits {
+		sort.Strings(h.ips)
+		action := "none"
+		if r.Block {
+			action = "disconnected"
+		}
+		t.logOverLimit(h.uid, "kick", r, h.local, h.elsewhr, h.limit, strings.Join(h.ips, ","), action)
+	}
+
 	// Close outside the lock: Close removes the conn from connMap.
 	for _, conn := range revoked {
 		conn.Close()
+	}
+	if r.Block && len(hits) > 0 {
+		// A kicked user starts a fresh delay if it comes back over the limit.
+		t.devMu.Lock()
+		for _, h := range hits {
+			delete(t.overHist, h.uid)
+		}
+		t.devMu.Unlock()
 	}
 }
 
@@ -597,6 +875,7 @@ func formatInt36(n int64) string {
 // GetUserTraffic returns per-user cumulative traffic and alive IPs.
 // This is O(users), not O(connections).
 func (t *ConnTracker) GetUserTraffic() (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int) {
+	r := t.deviceRule()
 	t.usersMu.RLock()
 	traffic = make(map[int][2]int64, len(t.users))
 	aliveIPs = make(map[int]map[string]bool, len(t.users))
@@ -607,7 +886,7 @@ func (t *ConnTracker) GetUserTraffic() (traffic map[int][2]int64, aliveIPs map[i
 			traffic[uid] = [2]int64{up, down}
 		}
 
-		ips := us.aliveIPList()
+		ips := us.aliveIPList(r)
 		if ips != nil {
 			aliveIPs[uid] = ips
 		}
@@ -617,6 +896,7 @@ func (t *ConnTracker) GetUserTraffic() (traffic map[int][2]int64, aliveIPs map[i
 		us.mu.Unlock()
 	}
 	t.usersMu.RUnlock()
+	t.sampleDevices(time.Now())
 	return
 }
 
@@ -808,7 +1088,7 @@ func (c *trackedConn) Write(b []byte) (int, error) {
 
 	n, err := c.Conn.Write(b)
 	if n > 0 {
-		c.act.add(int64(n))
+		c.act.addWrite(int64(n))
 		if c.us != nil {
 			c.us.download.Add(int64(n)) // 向入站写入 = 用户下载
 		}
@@ -870,7 +1150,7 @@ func (c *trackedConn) UnwrapWriter() (io.Writer, []N.CountFunc) {
 	// Zero-copy relaying bypasses Write, so the bytes are also counted here.
 	count := c.makeCountFunc(&c.us.download, c.downLimiter) // 向入站写入 = 用户下载
 	return c.Conn, []N.CountFunc{func(n int64) {
-		c.act.add(n)
+		c.act.addWrite(n)
 		count(n)
 	}}
 }
@@ -948,7 +1228,7 @@ func (c *trackedPacketConn) WritePacket(buffer *buf.Buffer, dest singM.Socksaddr
 
 	err := c.PacketConn.WritePacket(buffer, dest)
 	if err == nil {
-		c.act.add(n)
+		c.act.addWrite(n)
 		if c.us != nil {
 			c.us.download.Add(n) // 向入站写入 = 用户下载
 		}
@@ -1008,7 +1288,7 @@ func (c *trackedPacketConn) UnwrapPacketWriter() (N.PacketWriter, []N.CountFunc)
 	}
 	count := c.makeCountFunc(&c.us.upload, c.downLimiter)
 	return c.PacketConn, []N.CountFunc{func(n int64) {
-		c.act.add(n)
+		c.act.addWrite(n)
 		count(n)
 	}}
 }

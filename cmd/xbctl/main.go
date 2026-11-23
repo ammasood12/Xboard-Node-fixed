@@ -204,6 +204,7 @@ func printUsage() {
   xbctl instance get <id> [--output text|json]
   xbctl config init --mode node|machine --panel-url URL --token TOKEN [flags]
   xbctl config health-port [--config PATH]
+  xbctl config device [--config PATH]   show effective sync/device_limit settings
   xbctl service status|start|stop|restart|enable|disable|logs
   xbctl health
   xbctl bind add-node --panel-url URL --token TOKEN --node-id ID [--node-type TYPE] [--kernel singbox|xray]
@@ -1191,13 +1192,15 @@ func machineIDPtr(cfg *config.Config) *int {
 
 func runConfig(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: xbctl config <init|health-port>")
+		return errors.New("usage: xbctl config <init|health-port|device>")
 	}
 	switch args[0] {
 	case "init":
 		return runConfigInit(args[1:])
 	case "health-port":
 		return runConfigHealthPort(args[1:])
+	case "device":
+		return runConfigDevice(args[1:])
 	default:
 		return fmt.Errorf("unknown config command: %s", args[0])
 	}
@@ -1529,6 +1532,55 @@ func writeInstallMetaVersioned(path string, root *config.RootConfig, ver, latest
 // runConfigHealthPort reads health_port from an existing config file and
 // prints it to stdout. Exits silently if the file does not exist or has
 // no health_port.
+// runConfigDevice prints the effective sync: and device_limit: settings of a
+// config file (defaults applied), and reports unknown keys and invalid values.
+// It reads the file only; it does not talk to the running node.
+func runConfigDevice(args []string) error {
+	cfgPath := defaultConfigPath
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--config" && i+1 < len(args) {
+			i++
+			cfgPath = args[i]
+		}
+	}
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", cfgPath, err)
+	}
+	root := &config.RootConfig{}
+	if err := yaml.Unmarshal(data, root); err != nil {
+		return fmt.Errorf("parse %s: %w", cfgPath, err)
+	}
+	fmt.Printf("config: %s\n", cfgPath)
+	show := func(label string, sync *config.SyncConfig, dev *config.DeviceLimitConfig) {
+		fmt.Printf("%s\n", label)
+		fmt.Printf("  rest_polling_with_websocket=%t\n", sync.RESTPolling())
+		for _, f := range strings.Fields(dev.Runtime().Summary()) {
+			fmt.Printf("  %s\n", f)
+		}
+		if err := dev.Validate(); err != nil {
+			fmt.Printf("  INVALID: %v\n", err)
+		}
+	}
+	if len(root.Instances) == 0 {
+		show("settings:", root.Sync, root.DeviceLimit)
+	}
+	for i, inst := range root.Instances {
+		sync, dev := inst.Sync, inst.DeviceLimit
+		if sync == nil {
+			sync = root.Sync
+		}
+		if dev == nil {
+			dev = root.DeviceLimit
+		}
+		show(fmt.Sprintf("instances[%d]:", i), sync, dev)
+	}
+	for _, msg := range config.CheckDeviceKeys(data) {
+		fmt.Printf("UNKNOWN KEY (ignored by the node): %s\n", msg)
+	}
+	return nil
+}
+
 func runConfigHealthPort(args []string) error {
 	cfgPath := defaultConfigPath
 	for i := 0; i < len(args); i++ {

@@ -24,3 +24,28 @@
 #       token: "machine-token-2"
 #     log:
 #       level: "debug"   # override for this instance only
+
+# ── Panel sync (fixed2) ──
+# sync:
+#   rest_polling_with_websocket: true   # true = keep REST polling while the websocket is connected
+
+# ── Device limit (sing-box kernel only; every key is optional) ──
+# The defaults below behave like fixed3 and never block anyone.
+# device_limit:
+#   count_method: recent_connection     # recent_connection | traffic | off
+#   #   recent_connection = an IP is a device while its client sent data within recent_connection_seconds
+#   #   traffic           = an IP is a device only while it moved min_traffic_kb within traffic_check_seconds
+#   #   off               = every connected IP counts, nothing is blocked
+#   recent_connection_seconds: 180      # used by recent_connection
+#   min_traffic_kb: 100                 # used by traffic
+#   traffic_check_seconds: 60           # used by traffic; multiple of 10, 10..120
+#   ipv4_ipv6_counting: separate        # separate | merge (merge: devices = max(IPv4 devices, IPv6 devices))
+#   block_devices: false                # false = never reject or disconnect; true = really block
+#   log_over_limit_devices: true        # log every device found over the limit (rate limited per user)
+#   reject_new_device_immediately: false  # true = refuse a new IP at once when the limit is full
+#   over_limit_kick_after_minutes: 5    # kick only if over the limit this long ... (0 = kick at once)
+#   over_limit_watch_minutes: 10        # ... within the last this-many minutes
+#   tcp_keepalive_seconds: 180          # close dead client sockets (0 = off)
+#   clear_panel_when_user_idle: true    # idle user reports an empty device list so the panel drops old entries
+#   ignore_ips: []                      # IPs or CIDRs that never count and are never blocked (relays)
+# Check what a node will use:  xbctl config device

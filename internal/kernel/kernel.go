@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/cedar2025/xboard-node/internal/model"
@@ -159,6 +160,66 @@ func OverLimitDevices(local map[string]int, elsewhere map[string]bool, limit int
 		}
 	}
 	return over
+}
+
+// isIPv6 reports whether ip is an IPv6 address string.
+func isIPv6(ip string) bool { return strings.Contains(ip, ":") }
+
+// familyOf keeps only the entries of one address family.
+func familyOf(local map[string]int, elsewhere map[string]bool, v6 bool) (map[string]int, map[string]bool) {
+	l := make(map[string]int, len(local))
+	for ip, n := range local {
+		if isIPv6(ip) == v6 {
+			l[ip] = n
+		}
+	}
+	e := make(map[string]bool, len(elsewhere))
+	for ip := range elsewhere {
+		if isIPv6(ip) == v6 {
+			e[ip] = true
+		}
+	}
+	return l, e
+}
+
+// CountDevices returns how many devices a user has. Without merge it is the
+// number of distinct IPs. With merge it is max(IPv4 devices, IPv6 devices):
+// one phone that appears on both address families counts once.
+func CountDevices(local map[string]int, elsewhere map[string]bool, merge bool) int {
+	count := func(l map[string]int, e map[string]bool) int {
+		n := len(l)
+		for ip := range e {
+			if l[ip] == 0 {
+				n++
+			}
+		}
+		return n
+	}
+	if !merge {
+		return count(local, elsewhere)
+	}
+	l4, e4 := familyOf(local, elsewhere, false)
+	l6, e6 := familyOf(local, elsewhere, true)
+	a, b := count(l4, e4), count(l6, e6)
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// AdmitDeviceMerged is AdmitDevice for the merge counting mode: the count is
+// max(IPv4, IPv6), so a new IP only competes with the IPs of its own family.
+func AdmitDeviceMerged(local map[string]int, elsewhere map[string]bool, sourceIP string, limit int) bool {
+	l, e := familyOf(local, elsewhere, isIPv6(sourceIP))
+	return AdmitDevice(l, e, sourceIP, limit)
+}
+
+// OverLimitDevicesMerged is OverLimitDevices for the merge counting mode: each
+// address family is kept within limit on its own, so max(IPv4, IPv6) <= limit.
+func OverLimitDevicesMerged(local map[string]int, elsewhere map[string]bool, limit int) []string {
+	l4, e4 := familyOf(local, elsewhere, false)
+	l6, e6 := familyOf(local, elsewhere, true)
+	return append(OverLimitDevices(l4, e4, limit), OverLimitDevices(l6, e6, limit)...)
 }
 
 // ComputeHash returns a hash of config + user identities that would

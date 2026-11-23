@@ -18,6 +18,22 @@ import (
 // M is a shorthand for building JSON-like maps
 type M = map[string]interface{}
 
+// applyTCPKeepalive sets the inbound TCP keepalive: probe idle connections
+// after seconds and then every min(30, seconds). 0 turns keepalive off.
+func applyTCPKeepalive(inbound M, seconds int) {
+	if seconds <= 0 {
+		delete(inbound, "tcp_keep_alive")
+		delete(inbound, "tcp_keep_alive_interval")
+		return
+	}
+	interval := 30
+	if seconds < interval {
+		interval = seconds
+	}
+	inbound["tcp_keep_alive"] = fmt.Sprintf("%ds", seconds)
+	inbound["tcp_keep_alive_interval"] = fmt.Sprintf("%ds", interval)
+}
+
 func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
 	var outbounds []M
 	tags := make(map[string]bool)
@@ -55,6 +71,9 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 
 	inbound := buildInbound(nc, users, tc)
 	if inbound != nil {
+		if kcfg.TCPKeepaliveSeconds != nil {
+			applyTCPKeepalive(inbound, *kcfg.TCPKeepaliveSeconds)
+		}
 		cfg["inbounds"] = []M{inbound}
 	}
 

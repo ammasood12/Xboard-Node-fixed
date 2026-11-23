@@ -74,7 +74,7 @@ func testInboundContext(uuid, ip string) adapter.InboundContext {
 }
 
 func TestConnTrackerRoutedConnectionTracksTrafficAndAliveIPs(t *testing.T) {
-	tracker := NewConnTracker(0)
+	tracker := newTrafficTracker()
 	tracker.SetUserMap(map[string]int{"uuid-1": 1})
 	base := &testConn{reads: [][]byte{[]byte("hello")}}
 
@@ -121,7 +121,7 @@ func TestConnTrackerRoutedConnectionTracksTrafficAndAliveIPs(t *testing.T) {
 }
 
 func TestConnTrackerRoutedConnectionRejectsWhenDeviceLimitExceeded(t *testing.T) {
-	tracker := NewConnTracker(0)
+	tracker := newTrafficTracker()
 	tracker.SetUserMap(map[string]int{"uuid-1": 1})
 	tracker.SetDeviceLimitFunc(func(uuid string) (int, bool) {
 		if uuid != "uuid-1" {
@@ -148,7 +148,7 @@ func TestConnTrackerRoutedConnectionRejectsWhenDeviceLimitExceeded(t *testing.T)
 }
 
 func TestConnTrackerCheckDeviceGateMergesFreshGlobalDevices(t *testing.T) {
-	tracker := NewConnTracker(0)
+	tracker := newTrafficTracker()
 	tracker.SetUserMap(map[string]int{"uuid-1": 1})
 	us := tracker.users[1]
 	us.addConn("1.1.1.1").add(deviceMinBytes)
@@ -168,7 +168,7 @@ func TestConnTrackerCheckDeviceGateMergesFreshGlobalDevices(t *testing.T) {
 }
 
 func TestConnTrackerCloseByIDClosesTrackedConnection(t *testing.T) {
-	tracker := NewConnTracker(0)
+	tracker := newTrafficTracker()
 	tracker.SetUserMap(map[string]int{"uuid-1": 1})
 	base := &testConn{}
 	wrapped := tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", "1.1.1.1"), nil, nil)
@@ -185,7 +185,7 @@ func TestConnTrackerCloseByIDClosesTrackedConnection(t *testing.T) {
 }
 
 func TestConnTrackerRateLimitHonorsContextCancellation(t *testing.T) {
-	tracker := NewConnTracker(0)
+	tracker := newTrafficTracker()
 	tracker.SetUserMap(map[string]int{"uuid-1": 1})
 	oneBytePerSecond := func(uuid string) *rate.Limiter {
 		if uuid != "uuid-1" {
@@ -221,7 +221,7 @@ func TestConnTrackerRateLimitHonorsContextCancellation(t *testing.T) {
 }
 
 func limitedTracker(limit int) *ConnTracker {
-	tracker := NewConnTracker(0)
+	tracker := newTrafficTracker()
 	tracker.SetUserMap(map[string]int{"uuid-1": 1})
 	tracker.SetDeviceLimitFunc(func(string) (int, bool) { return limit, true })
 	return tracker
@@ -333,7 +333,7 @@ func TestConnTrackerGlobalEchoDoesNotDisconnectNextDevice(t *testing.T) {
 }
 
 func TestConnTrackerLimitsUploadAndDownloadSeparately(t *testing.T) {
-	tracker := NewConnTracker(0)
+	tracker := newTrafficTracker()
 	tracker.SetUserMap(map[string]int{"uuid-1": 1})
 	down := rate.NewLimiter(rate.Limit(1), 1000)
 	up := rate.NewLimiter(rate.Limit(1), 1000)

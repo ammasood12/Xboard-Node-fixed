@@ -57,6 +57,10 @@ type SingBox struct {
 	// uploadLimitFunc resolves a user UUID to their upload limiter.
 	uploadLimitFunc func(string) *rate.Limiter
 
+	// deviceRule is the device counting/blocking configuration (device_limit:).
+	// Forwarded to every new ConnTracker.
+	deviceRule *config.DeviceRuntime
+
 	// deviceLimitFunc resolves a user UUID to (limit, hasLimit) for gate-keeping.
 	// Set once by SetDeviceLimitFunc and forwarded to every new ConnTracker.
 	deviceLimitFunc func(string) (int, bool)
@@ -154,6 +158,9 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	}
 	if s.deviceLimitFunc != nil {
 		s.connTracker.SetDeviceLimitFunc(s.deviceLimitFunc)
+	}
+	if s.deviceRule != nil {
+		s.connTracker.SetDeviceConfig(*s.deviceRule)
 	}
 
 	s.trackerRegistered = false
@@ -391,6 +398,17 @@ func (s *SingBox) connTrackerSafe() *ConnTracker {
 	ct := s.connTracker
 	s.mu.Unlock()
 	return ct
+}
+
+// SetDeviceConfig sets how devices are counted and blocked (device_limit:).
+// Call it before Start; it also applies to a running tracker.
+func (s *SingBox) SetDeviceConfig(r config.DeviceRuntime) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deviceRule = &r
+	if s.connTracker != nil {
+		s.connTracker.SetDeviceConfig(r)
+	}
 }
 
 // SetSpeedLimitFunc configures per-user bandwidth throttling.

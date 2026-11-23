@@ -148,12 +148,15 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 	var k kernel.Kernel
 	switch cfg.Kernel.Type {
 	case "singbox":
-		k = singbox.New(cfg.Kernel)
+		k = newSingBox(cfg)
 	case "xray":
 		k = xray.New(cfg.Kernel)
+		if cfg.DeviceLimit != nil {
+			nlog.Core().Warn("device_limit options apply to the sing-box kernel only; xray keeps its own device handling")
+		}
 	default:
 		nlog.Core().Warn("unsupported kernel type, defaulting to sing-box", "type", cfg.Kernel.Type)
-		k = singbox.New(cfg.Kernel)
+		k = newSingBox(cfg)
 	}
 
 	l := limiter.New()
@@ -172,6 +175,18 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 		wsStatusCh:   make(chan controlplane.StatusChange, 4),
 		pullResults:  make(chan pullResult, 1),
 	}
+}
+
+// newSingBox builds the sing-box kernel with the device_limit settings.
+func newSingBox(cfg *config.Config) *singbox.SingBox {
+	rt := cfg.DeviceLimit.Runtime()
+	kc := cfg.Kernel
+	keepalive := rt.TCPKeepaliveSeconds
+	kc.TCPKeepaliveSeconds = &keepalive
+	sb := singbox.New(kc)
+	sb.SetDeviceConfig(rt)
+	nlog.Core().Info("device_limit: " + rt.Summary())
+	return sb
 }
 
 func (s *Service) Run(ctx context.Context) error {
@@ -224,13 +239,13 @@ func (s *Service) Run(ctx context.Context) error {
 			s.reportDevices()
 
 		case <-pullTicker.C:
-			// When WebSocket is connected, skip REST polling entirely.
-			// Config/user updates arrive via WS push.
-			// if s.wsClient != nil && s.wsClient.IsConnected() {
-			//	continue
-			//}
-			//nlog.Core().Debug("polling from API (ws not connected)")
-			// When WebSocket is connected, don't skip REST polling entirely.
+			// sync.rest_polling_with_websocket (default true) keeps REST
+			// polling running while the websocket is connected (fixed2). Set it
+			// to false to skip polling then; config and user updates arrive via
+			// WS push.
+			if !s.cfg.Sync.RESTPolling() && s.wsClient != nil && s.wsClient.IsConnected() {
+				continue
+			}
 			nlog.Core().Debug("polling from API")
 			s.pullViaAPIAsync(ctx)
 

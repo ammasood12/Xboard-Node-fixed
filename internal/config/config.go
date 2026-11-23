@@ -27,6 +27,11 @@ type Config struct {
 	Log     LogConfig     `yaml:"log"`
 	Runtime RuntimeConfig `yaml:"runtime"`
 	WS      WSConfig      `yaml:"ws"`
+	// Sync tunes panel sync (fixed2). nil = defaults.
+	Sync *SyncConfig `yaml:"sync,omitempty"`
+	// DeviceLimit selects how devices are counted and blocked (fixed3/4/5).
+	// nil = defaults (fixed3 counting, blocking off).
+	DeviceLimit *DeviceLimitConfig `yaml:"device_limit,omitempty"`
 	// Standalone enables a local-only node that never contacts the panel.
 	Standalone *StandaloneConfig `yaml:"standalone,omitempty"`
 	// HealthPort enables a lightweight HTTP health-check endpoint on the
@@ -142,6 +147,11 @@ type KernelConfig struct {
 	// customization of dns, outbounds, endpoints, route, experimental, etc.
 	// Compatible with V2bX OriginalPath format.
 	CustomConfig string `yaml:"custom_config"`
+
+	// TCPKeepaliveSeconds is the inbound TCP keepalive of the sing-box kernel,
+	// set from device_limit.tcp_keepalive_seconds (0 = off). nil keeps the
+	// built-in 180 s.
+	TCPKeepaliveSeconds *int `yaml:"-"`
 }
 
 type CertConfig struct {
@@ -195,6 +205,9 @@ func LoadRoot(path string) (*RootConfig, error) {
 	if err == nil {
 		if err := yaml.Unmarshal(data, rc); err != nil {
 			return nil, fmt.Errorf("parse config: %w", err)
+		}
+		for _, msg := range CheckDeviceKeys(data) {
+			nlog.Core().Warn("config: unknown key ignored", "detail", msg)
 		}
 		if len(rc.Instances) == 0 {
 			legacy := &Config{}
@@ -487,6 +500,13 @@ func (c *Config) inheritFrom(parent *Config) {
 	if c.WS.DiscoveryInterval == 0 {
 		c.WS.DiscoveryInterval = parent.WS.DiscoveryInterval
 	}
+	// Sync / device limit
+	if c.Sync == nil {
+		c.Sync = parent.Sync
+	}
+	if c.DeviceLimit == nil {
+		c.DeviceLimit = parent.DeviceLimit
+	}
 	// Runtime
 	if c.Runtime.GoGCPercent == 0 {
 		c.Runtime.GoGCPercent = parent.Runtime.GoGCPercent
@@ -723,6 +743,9 @@ func (c *Config) validate() error {
 	case "singbox", "xray":
 	default:
 		return fmt.Errorf("kernel.type must be 'singbox' or 'xray', got '%s'", c.Kernel.Type)
+	}
+	if err := c.DeviceLimit.Validate(); err != nil {
+		return err
 	}
 	if c.Cert.AutoTLS && c.Cert.Domain == "" {
 		return fmt.Errorf("cert.domain is required when cert.auto_tls is enabled")

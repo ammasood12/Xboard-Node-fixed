@@ -18,3 +18,19 @@ func TestBuildInbound_TCPKeepAlive(t *testing.T) {
 		assertMapValue(t, inbound, "tcp_keep_alive_interval", "30s")
 	}
 }
+
+func TestApplyTCPKeepalive(t *testing.T) {
+	in := M{"tcp_keep_alive": "180s", "tcp_keep_alive_interval": "30s"}
+	applyTCPKeepalive(in, 0)
+	if _, ok := in["tcp_keep_alive"]; ok {
+		t.Fatal("keepalive not removed for 0")
+	}
+	applyTCPKeepalive(in, 600)
+	if in["tcp_keep_alive"] != "600s" || in["tcp_keep_alive_interval"] != "30s" {
+		t.Fatalf("got %v", in)
+	}
+	applyTCPKeepalive(in, 20)
+	if in["tcp_keep_alive"] != "20s" || in["tcp_keep_alive_interval"] != "20s" {
+		t.Fatalf("got %v", in)
+	}
+}
