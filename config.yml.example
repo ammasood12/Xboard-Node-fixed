@@ -43,8 +43,8 @@
 #   block_devices: true                 # true = enforce the device limit the panel sets per user/package (users without a panel limit are never touched)
 #                                       # false = only count and log (test run), never reject or disconnect
 #   log_over_limit_devices: true        # log every device found over the limit (rate limited per user)
-#   reject_new_device_immediately: false  # true = refuse a new IP at once when the limit is full
-#   over_limit_kick_after_minutes: 5    # kick only if over the limit this long ... (0 = kick at once)
+#   reject_new_device_immediately: true   # true = refuse a new IP at once when the limit is full (default)
+#   over_limit_kick_after_minutes: 0    # kick only if over the limit this long ... (0 = kick at once, default)
 #   over_limit_watch_minutes: 10        # ... within the last this-many minutes
 #   tcp_keepalive_seconds: 180          # close dead client sockets (0 = off)
 #   clear_panel_when_user_idle: true    # idle user reports an empty device list so the panel drops old entries

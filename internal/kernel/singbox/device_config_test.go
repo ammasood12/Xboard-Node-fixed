@@ -72,8 +72,8 @@ func TestDefaultConfigIsFixed3RecentConnection(t *testing.T) {
 	if r.CountMethod != config.CountRecentConnection || r.RecentConnection != 180*time.Second {
 		t.Fatalf("default method = %s / %v, want recent_connection / 180s", r.CountMethod, r.RecentConnection)
 	}
-	if !r.Block || r.Merge || r.RejectNewImmediately {
-		t.Fatalf("defaults: block on (the panel limit decides), no merge, no immediate reject: %+v", r)
+	if !r.Block || r.Merge || !r.RejectNewImmediately || r.KickAfter != 0 {
+		t.Fatalf("fixed3 defaults: block on (the panel limit decides), no merge, immediate reject, kick at once: %+v", r)
 	}
 	if !r.ClearPanelWhenUserIdle || !r.LogOverLimit || r.TCPKeepaliveSeconds != 180 {
 		t.Fatalf("unexpected defaults: %+v", r)
@@ -81,7 +81,7 @@ func TestDefaultConfigIsFixed3RecentConnection(t *testing.T) {
 }
 
 func TestRecentConnectionCountsNewConnectionAndClientData(t *testing.T) {
-	tr := deviceTracker(3, config.DeviceLimitConfig{})
+	tr := deviceTracker(3, config.DeviceLimitConfig{RejectNewDeviceImmediately: boolp(false), OverLimitKickAfterMinutes: intp(5)})
 	_, tc := connect(tr, "1.1.1.1")
 	us := tr.users[1]
 
@@ -111,7 +111,7 @@ func TestRecentConnectionCountsNewConnectionAndClientData(t *testing.T) {
 
 func TestClearPanelWhenUserIdleOffOmitsUser(t *testing.T) {
 	f := false
-	tr := deviceTracker(3, config.DeviceLimitConfig{ClearPanelWhenUserIdle: &f})
+	tr := deviceTracker(3, config.DeviceLimitConfig{RejectNewDeviceImmediately: boolp(false), OverLimitKickAfterMinutes: intp(5), ClearPanelWhenUserIdle: &f})
 	_, tc := connect(tr, "1.1.1.1")
 	tc.act.lastRead.Store(time.Now().Add(-time.Hour).UnixNano())
 	if got := tr.users[1].aliveIPList(tr.deviceRule()); got != nil {
@@ -146,21 +146,18 @@ func TestDefaultsBlockOnlyUsersWithAPanelLimit(t *testing.T) {
 		}
 	}
 
-	// With a panel limit the default config does block (after the delay).
+	// With a panel limit the default config (fixed3) refuses a new IP at once.
 	lim := deviceTracker(1, config.DeviceLimitConfig{})
 	keep, _ := connect(lim, "1.1.1.1")
-	over, _ := connect(lim, "2.2.2.2")
-	for i := 0; i < 10; i++ {
-		sample(lim)
-	}
-	if keep.closed || !over.closed {
-		t.Fatalf("default config must enforce the panel limit (keep closed=%v, over closed=%v)", keep.closed, over.closed)
+	over, tcOver := connect(lim, "2.2.2.2")
+	if tcOver != nil || keep.closed || !over.closed {
+		t.Fatalf("default config must refuse a new IP at the panel limit (tracked=%v, keep closed=%v, over closed=%v)", tcOver != nil, keep.closed, over.closed)
 	}
 }
 
 func TestOverLimitLogsActionNoneWhenNotBlocking(t *testing.T) {
 	lb := captureLog(t)
-	tr := deviceTracker(1, config.DeviceLimitConfig{BlockDevices: boolp(false), OverLimitKickAfterMinutes: intp(0)})
+	tr := deviceTracker(1, config.DeviceLimitConfig{RejectNewDeviceImmediately: boolp(false), BlockDevices: boolp(false), OverLimitKickAfterMinutes: intp(0)})
 	connect(tr, "1.1.1.1")
 	connect(tr, "2.2.2.2")
 	tr.disconnectOverLimit()
@@ -175,7 +172,7 @@ func TestOverLimitLogsActionNoneWhenNotBlocking(t *testing.T) {
 func TestLogOverLimitCanBeSwitchedOff(t *testing.T) {
 	lb := captureLog(t)
 	f := false
-	tr := deviceTracker(1, config.DeviceLimitConfig{BlockDevices: boolp(false), OverLimitKickAfterMinutes: intp(0), LogOverLimitDevices: &f})
+	tr := deviceTracker(1, config.DeviceLimitConfig{RejectNewDeviceImmediately: boolp(false), BlockDevices: boolp(false), OverLimitKickAfterMinutes: intp(0), LogOverLimitDevices: &f})
 	connect(tr, "1.1.1.1")
 	connect(tr, "2.2.2.2")
 	tr.disconnectOverLimit()
@@ -186,7 +183,7 @@ func TestLogOverLimitCanBeSwitchedOff(t *testing.T) {
 
 func TestOverLimitLogIsRateLimited(t *testing.T) {
 	lb := captureLog(t)
-	tr := deviceTracker(1, config.DeviceLimitConfig{BlockDevices: boolp(false), OverLimitKickAfterMinutes: intp(0)})
+	tr := deviceTracker(1, config.DeviceLimitConfig{RejectNewDeviceImmediately: boolp(false), BlockDevices: boolp(false), OverLimitKickAfterMinutes: intp(0)})
 	connect(tr, "1.1.1.1")
 	connect(tr, "2.2.2.2")
 	for i := 0; i < 5; i++ {
@@ -198,7 +195,7 @@ func TestOverLimitLogIsRateLimited(t *testing.T) {
 }
 
 func TestDelayedKickWaitsForPersistentOverLimit(t *testing.T) {
-	tr := deviceTracker(1, config.DeviceLimitConfig{BlockDevices: boolp(true)}) // kick after 5 min of 10
+	tr := deviceTracker(1, config.DeviceLimitConfig{RejectNewDeviceImmediately: boolp(false), OverLimitKickAfterMinutes: intp(5), BlockDevices: boolp(true)}) // kick after 5 min of 10
 	keep, _ := connect(tr, "1.1.1.1")
 	over, _ := connect(tr, "2.2.2.2")
 
@@ -220,7 +217,7 @@ func TestDelayedKickWaitsForPersistentOverLimit(t *testing.T) {
 }
 
 func TestDelayedKickNeedsNoContinuousOverage(t *testing.T) {
-	tr := deviceTracker(1, config.DeviceLimitConfig{BlockDevices: boolp(true)})
+	tr := deviceTracker(1, config.DeviceLimitConfig{RejectNewDeviceImmediately: boolp(false), OverLimitKickAfterMinutes: intp(5), BlockDevices: boolp(true)})
 	keep, _ := connect(tr, "1.1.1.1")
 	over, tcOver := connect(tr, "2.2.2.2")
 
@@ -249,7 +246,7 @@ func TestDelayedKickNeedsNoContinuousOverage(t *testing.T) {
 }
 
 func TestKickedUserStartsFreshDelay(t *testing.T) {
-	tr := deviceTracker(1, config.DeviceLimitConfig{BlockDevices: boolp(true)})
+	tr := deviceTracker(1, config.DeviceLimitConfig{RejectNewDeviceImmediately: boolp(false), OverLimitKickAfterMinutes: intp(5), BlockDevices: boolp(true)})
 	connect(tr, "1.1.1.1")
 	connect(tr, "2.2.2.2")
 	for i := 0; i < 10; i++ {
@@ -264,7 +261,7 @@ func TestKickedUserStartsFreshDelay(t *testing.T) {
 }
 
 func TestHistoryDroppedOnceUserStaysUnderLimit(t *testing.T) {
-	tr := deviceTracker(1, config.DeviceLimitConfig{BlockDevices: boolp(true)})
+	tr := deviceTracker(1, config.DeviceLimitConfig{RejectNewDeviceImmediately: boolp(false), OverLimitKickAfterMinutes: intp(5), BlockDevices: boolp(true)})
 	connect(tr, "1.1.1.1")
 	_, tc2 := connect(tr, "2.2.2.2")
 	sample(tr)
@@ -282,7 +279,7 @@ func TestHistoryDroppedOnceUserStaysUnderLimit(t *testing.T) {
 }
 
 func TestGateRejectsNewDeviceOnlyWhenPersistentlyOver(t *testing.T) {
-	tr := deviceTracker(1, config.DeviceLimitConfig{BlockDevices: boolp(true)})
+	tr := deviceTracker(1, config.DeviceLimitConfig{RejectNewDeviceImmediately: boolp(false), OverLimitKickAfterMinutes: intp(5), BlockDevices: boolp(true)})
 	connect(tr, "1.1.1.1")
 
 	if _, tc := connect(tr, "2.2.2.2"); tc == nil {
@@ -298,7 +295,7 @@ func TestGateRejectsNewDeviceOnlyWhenPersistentlyOver(t *testing.T) {
 }
 
 func TestGateRejectsAtOnceWithRejectNewDeviceImmediately(t *testing.T) {
-	tr := deviceTracker(1, config.DeviceLimitConfig{BlockDevices: boolp(true), RejectNewDeviceImmediately: true})
+	tr := deviceTracker(1, config.DeviceLimitConfig{OverLimitKickAfterMinutes: intp(5), BlockDevices: boolp(true), RejectNewDeviceImmediately: boolp(true)})
 	connect(tr, "1.1.1.1")
 	if base, tc := connect(tr, "2.2.2.2"); tc != nil || !base.closed {
 		t.Fatal("new device over the limit was not rejected at once")
@@ -307,7 +304,7 @@ func TestGateRejectsAtOnceWithRejectNewDeviceImmediately(t *testing.T) {
 
 func TestGateDryRunAdmitsButLogsWouldReject(t *testing.T) {
 	lb := captureLog(t)
-	tr := deviceTracker(1, config.DeviceLimitConfig{BlockDevices: boolp(false), RejectNewDeviceImmediately: true})
+	tr := deviceTracker(1, config.DeviceLimitConfig{OverLimitKickAfterMinutes: intp(5), BlockDevices: boolp(false), RejectNewDeviceImmediately: boolp(true)})
 	connect(tr, "1.1.1.1")
 	base, tc := connect(tr, "2.2.2.2")
 	if tc == nil || base.closed {
@@ -320,7 +317,7 @@ func TestGateDryRunAdmitsButLogsWouldReject(t *testing.T) {
 }
 
 func TestMergeCountsOnePhoneOnBothFamiliesOnce(t *testing.T) {
-	sep := deviceTracker(1, config.DeviceLimitConfig{BlockDevices: boolp(false), OverLimitKickAfterMinutes: intp(0)})
+	sep := deviceTracker(1, config.DeviceLimitConfig{RejectNewDeviceImmediately: boolp(false), BlockDevices: boolp(false), OverLimitKickAfterMinutes: intp(0)})
 	connect(sep, "111.52.73.92")
 	connect(sep, "2409:8a0c:872:4ed0:824:af02:ca09:3928")
 	sample(sep)
@@ -331,7 +328,7 @@ func TestMergeCountsOnePhoneOnBothFamiliesOnce(t *testing.T) {
 		t.Fatal("separate counting: IPv4 + IPv6 should be 2 devices, over a limit of 1")
 	}
 
-	mrg := deviceTracker(1, config.DeviceLimitConfig{BlockDevices: boolp(false), OverLimitKickAfterMinutes: intp(0), IPv4IPv6Counting: config.CountMerge})
+	mrg := deviceTracker(1, config.DeviceLimitConfig{RejectNewDeviceImmediately: boolp(false), BlockDevices: boolp(false), OverLimitKickAfterMinutes: intp(0), IPv4IPv6Counting: config.CountMerge})
 	v4, _ := connect(mrg, "111.52.73.92")
 	v6, _ := connect(mrg, "2409:8a0c:872:4ed0:824:af02:ca09:3928")
 	sample(mrg)
@@ -344,7 +341,7 @@ func TestMergeCountsOnePhoneOnBothFamiliesOnce(t *testing.T) {
 }
 
 func TestMergeStillKicksASecondDeviceOfTheSameFamily(t *testing.T) {
-	tr := deviceTracker(1, config.DeviceLimitConfig{BlockDevices: boolp(true), OverLimitKickAfterMinutes: intp(0), IPv4IPv6Counting: config.CountMerge})
+	tr := deviceTracker(1, config.DeviceLimitConfig{RejectNewDeviceImmediately: boolp(false), BlockDevices: boolp(true), OverLimitKickAfterMinutes: intp(0), IPv4IPv6Counting: config.CountMerge})
 	a, _ := connect(tr, "1.1.1.1")
 	b, _ := connect(tr, "2.2.2.2")
 	v6, _ := connect(tr, "2409:8a0c:872:4ed0::1")
@@ -358,7 +355,7 @@ func TestMergeStillKicksASecondDeviceOfTheSameFamily(t *testing.T) {
 }
 
 func TestMergeGateAdmitsNewFamilyAtTheLimit(t *testing.T) {
-	tr := deviceTracker(1, config.DeviceLimitConfig{BlockDevices: boolp(true), RejectNewDeviceImmediately: true, IPv4IPv6Counting: config.CountMerge})
+	tr := deviceTracker(1, config.DeviceLimitConfig{OverLimitKickAfterMinutes: intp(5), BlockDevices: boolp(true), RejectNewDeviceImmediately: boolp(true), IPv4IPv6Counting: config.CountMerge})
 	connect(tr, "1.1.1.1")
 	if _, tc := connect(tr, "2409:8a0c:872:4ed0::1"); tc == nil {
 		t.Fatal("IPv6 refused although only one IPv4 device is online (the same phone)")
@@ -370,7 +367,7 @@ func TestMergeGateAdmitsNewFamilyAtTheLimit(t *testing.T) {
 
 func TestIgnoredIPsNeverCountOrGetBlocked(t *testing.T) {
 	tr := deviceTracker(1, config.DeviceLimitConfig{
-		BlockDevices: boolp(true), RejectNewDeviceImmediately: true, OverLimitKickAfterMinutes: intp(0),
+		BlockDevices: boolp(true), RejectNewDeviceImmediately: boolp(true), OverLimitKickAfterMinutes: intp(0),
 		IgnoreIPs: []string{"10.0.0.0/8", "2605:e440:b::302"},
 	})
 	connect(tr, "1.1.1.1")
@@ -389,7 +386,7 @@ func TestIgnoredIPsNeverCountOrGetBlocked(t *testing.T) {
 }
 
 func TestCountMethodOffReportsAllAndNeverBlocks(t *testing.T) {
-	tr := deviceTracker(1, config.DeviceLimitConfig{CountMethod: config.CountOff, BlockDevices: boolp(true), RejectNewDeviceImmediately: true, OverLimitKickAfterMinutes: intp(0)})
+	tr := deviceTracker(1, config.DeviceLimitConfig{CountMethod: config.CountOff, BlockDevices: boolp(true), RejectNewDeviceImmediately: boolp(true), OverLimitKickAfterMinutes: intp(0)})
 	a, _ := connect(tr, "1.1.1.1")
 	b, tcB := connect(tr, "2.2.2.2")
 	if tcB == nil {
@@ -406,7 +403,7 @@ func TestCountMethodOffReportsAllAndNeverBlocks(t *testing.T) {
 }
 
 func TestTrafficMethodUsesConfiguredThresholdAndWindow(t *testing.T) {
-	tr := deviceTracker(3, config.DeviceLimitConfig{CountMethod: config.CountTraffic, MinTrafficKB: 500, TrafficCheckSeconds: 30})
+	tr := deviceTracker(3, config.DeviceLimitConfig{RejectNewDeviceImmediately: boolp(false), OverLimitKickAfterMinutes: intp(5), CountMethod: config.CountTraffic, MinTrafficKB: 500, TrafficCheckSeconds: 30})
 	_, tc := connect(tr, "1.1.1.1")
 	us := tr.users[1]
 	now := bucketStart()

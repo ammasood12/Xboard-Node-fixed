@@ -14,13 +14,13 @@ func TestDeviceLimitDefaults(t *testing.T) {
 	if r.MinTrafficBytes != 100*1024 || r.TrafficCheckSeconds != 60 {
 		t.Errorf("traffic defaults %d / %d", r.MinTrafficBytes, r.TrafficCheckSeconds)
 	}
-	if !r.Block || r.Merge || r.RejectNewImmediately {
-		t.Errorf("blocking must default on (the panel limit decides), merge and immediate reject off: %+v", r)
+	if !r.Block || r.Merge || !r.RejectNewImmediately {
+		t.Errorf("fixed3 defaults: blocking on (the panel limit decides), merge off, immediate reject on: %+v", r)
 	}
 	if !r.LogOverLimit || !r.ClearPanelWhenUserIdle {
 		t.Errorf("log and clear-idle defaults must be on: %+v", r)
 	}
-	if r.KickAfter != 5*time.Minute || r.Watch != 10*time.Minute || r.TCPKeepaliveSeconds != 180 {
+	if r.KickAfter != 0 || r.Watch != 10*time.Minute || r.TCPKeepaliveSeconds != 180 {
 		t.Errorf("timing defaults: %v %v %d", r.KickAfter, r.Watch, r.TCPKeepaliveSeconds)
 	}
 	if !(*SyncConfig)(nil).RESTPolling() {
@@ -58,7 +58,7 @@ func TestDeviceLimitValidate(t *testing.T) {
 		{"recent too short", DeviceLimitConfig{RecentConnectionSeconds: 5}, "recent_connection_seconds"},
 		{"kick too long", DeviceLimitConfig{OverLimitKickAfterMinutes: &tooBig}, "over_limit_kick_after_minutes"},
 		{"watch smaller than kick", DeviceLimitConfig{OverLimitKickAfterMinutes: &five, OverLimitWatchMinutes: 3}, "over_limit_watch_minutes"},
-		{"watch smaller than default kick", DeviceLimitConfig{OverLimitWatchMinutes: 3}, "over_limit_watch_minutes"},
+		{"watch small with default kick", DeviceLimitConfig{OverLimitWatchMinutes: 3}, ""},
 		{"kick off needs no watch", DeviceLimitConfig{OverLimitKickAfterMinutes: &zero, OverLimitWatchMinutes: 3}, ""},
 		{"keepalive off", DeviceLimitConfig{TCPKeepaliveSeconds: &zero}, ""},
 		{"bad ignore", DeviceLimitConfig{IgnoreIPs: []string{"not-an-ip"}}, "ignore_ips"},

@@ -49,8 +49,9 @@ func (c *SyncConfig) RESTPolling() bool {
 // DeviceLimitConfig selects how devices are counted and what happens to
 // devices over a user's limit. It applies to the sing-box kernel; xray keeps
 // its own device handling. The limit itself always comes from the panel (per
-// user or package); with the zero value the node enforces it with fixed3
-// counting, after the delayed over-limit check.
+// user or package); with the zero value the node enforces it with the fixed3
+// rule: 180 s recent-connection counting, a new IP refused at once when the
+// user is at the limit, and over-limit IPs disconnected at once.
 type DeviceLimitConfig struct {
 	// CountMethod: recent_connection | traffic | off. Default recent_connection.
 	CountMethod string `yaml:"count_method,omitempty"`
@@ -83,12 +84,12 @@ type DeviceLimitConfig struct {
 	// RejectNewDeviceImmediately refuses a new IP at once when the user is
 	// already at the limit. false = a new IP is let in and only handled by the
 	// delayed over-limit check below (or by the reject check once the user has
-	// been over the limit for a while).
-	RejectNewDeviceImmediately bool `yaml:"reject_new_device_immediately,omitempty"`
+	// been over the limit for a while). nil = true (fixed3).
+	RejectNewDeviceImmediately *bool `yaml:"reject_new_device_immediately,omitempty"`
 
 	// OverLimitKickAfterMinutes: kick only if the user was over the limit for
 	// at least this long within the last OverLimitWatchMinutes. 0 = kick at
-	// once (old behaviour). nil = 5. OverLimitWatchMinutes nil/0 = 10.
+	// once (fixed3). nil = 0. OverLimitWatchMinutes nil/0 = 10.
 	OverLimitKickAfterMinutes *int `yaml:"over_limit_kick_after_minutes,omitempty"`
 	OverLimitWatchMinutes     int  `yaml:"over_limit_watch_minutes,omitempty"`
 
@@ -155,8 +156,8 @@ func (c *DeviceLimitConfig) Runtime() DeviceRuntime {
 		Merge:                  c.IPv4IPv6Counting == CountMerge,
 		Block:                  boolOr(c.BlockDevices, true),
 		LogOverLimit:           boolOr(c.LogOverLimitDevices, true),
-		RejectNewImmediately:   c.RejectNewDeviceImmediately,
-		KickAfter:              time.Duration(intOr(c.OverLimitKickAfterMinutes, 5)) * time.Minute,
+		RejectNewImmediately:   boolOr(c.RejectNewDeviceImmediately, true),
+		KickAfter:              time.Duration(intOr(c.OverLimitKickAfterMinutes, 0)) * time.Minute,
 		Watch:                  time.Duration(firstInt(c.OverLimitWatchMinutes, 10)) * time.Minute,
 		TCPKeepaliveSeconds:    intOr(c.TCPKeepaliveSeconds, 180),
 		ClearPanelWhenUserIdle: boolOr(c.ClearPanelWhenUserIdle, true),
@@ -226,11 +227,6 @@ func (c *DeviceLimitConfig) Validate() error {
 		if watch < *c.OverLimitKickAfterMinutes {
 			return fmt.Errorf("device_limit.over_limit_watch_minutes (%d) must not be smaller than over_limit_kick_after_minutes (%d)",
 				watch, *c.OverLimitKickAfterMinutes)
-		}
-	}
-	if c.OverLimitKickAfterMinutes == nil {
-		if watch := firstInt(c.OverLimitWatchMinutes, 10); watch < 5 {
-			return fmt.Errorf("device_limit.over_limit_watch_minutes (%d) must not be smaller than the default over_limit_kick_after_minutes (5)", watch)
 		}
 	}
 	if c.TCPKeepaliveSeconds != nil {

@@ -23,7 +23,7 @@ func trafficRule() config.DeviceRuntime {
 	return (&config.DeviceLimitConfig{
 		CountMethod:                config.CountTraffic,
 		BlockDevices:               boolp(true),
-		RejectNewDeviceImmediately: true,
+		RejectNewDeviceImmediately: boolp(true),
 		OverLimitKickAfterMinutes:  intp(0),
 	}).Runtime()
 }

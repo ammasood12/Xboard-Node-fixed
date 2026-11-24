@@ -69,13 +69,13 @@ device_limit:
     # reject_new_device_immediately:
     #   false = a new IP is let in and only handled by the delayed check below
     #   true  = a new IP is refused at once when the user is already at the limit
-    # Built-in default: false
+    # Built-in default: true (fixed3). This suggested file uses the delayed check.
     reject_new_device_immediately: false
 
     # over_limit_kick_after_minutes: disconnect only if the user was over the limit for
     # this many minutes within the last over_limit_watch_minutes. 0 = disconnect at once.
     # If real users get kicked by mistake (carrier / campus NAT), raise this first.
-    # Built-in default: 5
+    # Built-in default: 0 (fixed3). This suggested file uses a 5 minute delay.
     over_limit_kick_after_minutes: 5
 
     # over_limit_watch_minutes: the window the value above is measured in.
