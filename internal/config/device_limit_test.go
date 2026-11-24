@@ -104,7 +104,7 @@ func TestIgnored(t *testing.T) {
 func TestSummary(t *testing.T) {
 	r := (&DeviceLimitConfig{CountMethod: "traffic", IPv4IPv6Counting: "merge"}).Runtime()
 	s := r.Summary()
-	for _, want := range []string{"method=traffic", "min=100KB/60s", "ipv4_ipv6=merge", "block=true", "kick_after=5m/10m"} {
+	for _, want := range []string{"method=traffic", "min=100KB/60s", "ipv4_ipv6=merge", "block=true", "reject_new=true", "kick_after=0m/10m"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("summary %q missing %q", s, want)
 		}
