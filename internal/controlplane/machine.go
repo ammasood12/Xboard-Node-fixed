@@ -20,6 +20,10 @@ type MachinePanelControlPlane struct {
 	push   PushClient // virtual push client from WS mux (may be nil)
 
 	registerFn func(statuses chan<- StatusChange) *NodeMailbox
+
+	// mailbox is the node's WS mailbox, captured in Initial. Poll refreshes its
+	// user baseline on every fresh REST user list (fixed8).
+	mailbox *NodeMailbox
 }
 
 // NewMachinePanelControlPlane creates a per-node control plane for machine mode.
@@ -88,6 +92,7 @@ func (p *MachinePanelControlPlane) Initial(
 	if p.push != nil {
 		if p.registerFn != nil {
 			bootstrap.Mailbox = p.registerFn(statuses)
+			p.mailbox = bootstrap.Mailbox // fixed8: keep for Poll baseline sync
 		}
 		bootstrap.Push = p.push
 	}
@@ -108,6 +113,11 @@ func (p *MachinePanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 	case <-ctx.Done():
 		return Snapshot{}, ctx.Err()
 	default:
+	}
+	// fixed8: a fresh (non-304) REST user list is the truth; refresh the mailbox
+	// delta baseline so later WS deltas cannot resurrect users REST removed.
+	if users != nil && p.mailbox != nil {
+		p.mailbox.SyncBaseline(model.UserSpecsFromPanel(users))
 	}
 	nodeSpec, err := model.NodeSpecFromPanelValidated(configSnapshot, p.kcfg)
 	if err != nil {

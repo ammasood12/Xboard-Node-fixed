@@ -60,6 +60,21 @@ func (m *NodeMailbox) SeedBaseline(users []model.UserSpec, config *model.NodeSpe
 	}
 }
 
+// SyncBaseline replaces the delta baseline with the latest REST-derived user
+// list (fixed8). Without it the baseline stays at the startup snapshot, so a
+// later WS delta is applied on a stale list and the drained "full" list
+// re-admits users that REST already removed (e.g. expired users). It does not
+// mark the users dirty: the node's live state already matches the REST list.
+func (m *NodeMailbox) SyncBaseline(users []model.UserSpec) {
+	if users == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.users = cloneUsers(users)
+	m.hasFullUserState = true
+}
+
 func (m *NodeMailbox) Apply(event Event) {
 	m.mu.Lock()
 	changed := false
